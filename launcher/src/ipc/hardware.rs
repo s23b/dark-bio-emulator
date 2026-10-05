@@ -283,15 +283,22 @@ mod tests {
         }
     }
 
-    /// The payload limit allows COBS overhead and bounds unterminated input.
+    /// Maximum frames cross both ways, with COBS overhead and malformed input bounded.
     #[test]
     fn test_hardware_frame_limits() {
         let (mut client, mut peer, _endpoint, _server) = pair();
-        let sender = std::thread::spawn(move || peer.send(&"x".repeat(65536)).unwrap());
+        let sender = std::thread::spawn(move || {
+            peer.send(&"x".repeat(65536)).unwrap();
+            assert_eq!(
+                peer.read(Duration::from_secs(3)).unwrap(),
+                "y".repeat(65536)
+            );
+        });
         assert_eq!(
             client.read(Duration::from_secs(3)).unwrap(),
             "x".repeat(65536)
         );
+        client.send(&"y".repeat(65536)).unwrap();
         sender.join().unwrap();
         assert_eq!(
             client.send(&"x".repeat(65537)).unwrap_err().kind(),

@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Windows pipe access control, connection deadlines and read readiness.
+//! Windows pipe access control, connection deadlines and nonblocking I/O.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write};
@@ -31,7 +31,7 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::SECURITY_IDENTIFICATION,
     System::{
-        Pipes::{PIPE_NOWAIT, PeekNamedPipe, SetNamedPipeHandleState},
+        Pipes::{GetNamedPipeInfo, PIPE_NOWAIT, PeekNamedPipe, SetNamedPipeHandleState},
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
@@ -55,6 +55,31 @@ impl AsHandle for Stream {
 
 impl Write for Stream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // PIPE_NOWAIT can accept zero bytes when the whole write cannot fit,
+        // even on an empty byte pipe. Retrying that size cannot make progress.
+        let mut output = 0;
+        let mut input = 0;
+        // SAFETY: the pipe handle stays alive and both size outputs are writable
+        if unsafe {
+            GetNamedPipeInfo(
+                self.as_handle().as_raw_handle(),
+                ptr::null_mut(),
+                &mut output,
+                &mut input,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Buffer directions are relative to the server. A zero capacity means
+        // allocation on demand, so probe with one byte to keep writes bounded.
+        let capacity = match self {
+            Self::Client(_) => input,
+            Self::Server(_) => output,
+        };
+        let bytes = &bytes[..bytes.len().min(capacity.max(1) as usize)];
         match self {
             Self::Client(file) => file.write(bytes),
             Self::Server(socket) => socket.write(bytes),
