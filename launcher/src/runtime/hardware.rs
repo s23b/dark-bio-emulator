@@ -12,7 +12,6 @@
 //! replayed across connections.
 
 use std::io::ErrorKind;
-use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -21,18 +20,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tungstenite::{Message, WebSocket, protocol::WebSocketConfig};
 
 use crate::diagnostics::log;
+use crate::ipc::hardware::{Channel, Endpoint, HELLO};
 
 /// Pause between failed connections, including while the guest is booting.
 const RETRY: Duration = Duration::from_secs(1);
-/// Bounds socket writes without limiting how long boot may take.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Limits button latency when the guest sends no hardware frames.
 const INPUT_POLL: Duration = Duration::from_millis(10);
-/// Hardware frames contain only a few LED values or identity claims.
-const MAX_FRAME: usize = 64 * 1024;
 /// GPIO for the active-low reset button on the emulated carrier.
 const BUTTON_PIN: &str = "5";
 /// GPIO selecting firmware control of the LEDs.
@@ -170,8 +165,6 @@ struct Inner {
     connection: Mutex<Option<Connection>>,
     /// Prevents reconnects after QEMU exits.
     stopping: AtomicBool,
-    /// A duplicate handle lets shutdown interrupt a pending handshake or I/O.
-    socket: Mutex<Option<TcpStream>>,
 }
 
 /// The runtime's hardware controller, shared with optional state readers.
@@ -184,7 +177,6 @@ impl Default for Controller {
             state: Mutex::new(State::default()),
             connection: Mutex::new(None),
             stopping: AtomicBool::new(false),
-            socket: Mutex::new(None),
         }))
     }
 }
@@ -196,13 +188,13 @@ impl Controller {
     }
 
     /// Start the sole hardware connection after QEMU has been spawned.
-    pub(crate) fn start(&self, address: SocketAddr) {
+    pub(crate) fn start(&self, endpoint: Endpoint, pid: u32) {
         let mut connection = self.0.connection.lock().unwrap();
         assert!(connection.is_none(), "hardware already started");
         self.update(|state| state.phase = Phase::Booting);
         let (buttons, receiver) = mpsc::sync_channel(16);
         let controller = self.clone();
-        let thread = thread::spawn(move || controller.run(address, receiver));
+        let thread = thread::spawn(move || controller.run(endpoint, pid, receiver));
         *connection = Some(Connection { buttons, thread });
     }
 
@@ -217,9 +209,6 @@ impl Controller {
             state.cli_pressed = false;
             state.phase = Phase::Stopped;
         });
-        if let Some(socket) = self.0.socket.lock().unwrap().take() {
-            let _ = socket.shutdown(Shutdown::Both);
-        }
         if let Some(connection) = connection {
             connection.thread.thread().unpark();
             let _ = connection.thread.join();
@@ -290,17 +279,11 @@ impl Controller {
     }
 
     /// Attach when the guest listens, preserving pending handshakes during boot.
-    fn run(&self, address: SocketAddr, buttons: mpsc::Receiver<Button>) {
+    fn run(&self, endpoint: Endpoint, pid: u32, buttons: mpsc::Receiver<Button>) {
         while !self.0.stopping.load(Ordering::SeqCst) {
-            match self.connect(address) {
+            match endpoint.connect(pid, RETRY) {
                 Ok(socket) => {
-                    self.update(|state| {
-                        state.connected = true;
-                        state.generation += 1;
-                    });
-                    let generation = self.snapshot().generation;
-                    log!("[hardware] connected to {address}");
-                    if let Err(err) = self.serve(socket, &buttons, generation) {
+                    if let Err(err) = self.serve(socket, &buttons) {
                         log!("[hardware] connection ended: {err:#}");
                     }
                     self.update(|state| {
@@ -315,7 +298,6 @@ impl Controller {
                 }
                 Err(err) => log!("[hardware] waiting for guest: {err}"),
             }
-            self.0.socket.lock().unwrap().take();
             while let Ok(button) = buttons.try_recv() {
                 let _ = button
                     .reply
@@ -327,41 +309,11 @@ impl Controller {
         }
     }
 
-    /// Keep the handshake blocking until the guest responds or shutdown closes it.
-    fn connect(&self, address: SocketAddr) -> Result<WebSocket<TcpStream>> {
-        let stream = TcpStream::connect_timeout(&address, RETRY)?;
-        stream.set_nodelay(true)?;
-        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        {
-            let mut socket = self.0.socket.lock().unwrap();
-            if self.0.stopping.load(Ordering::SeqCst) {
-                bail!("hardware has stopped");
-            }
-            *socket = Some(stream.try_clone()?);
-        }
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(MAX_FRAME))
-            .max_frame_size(Some(MAX_FRAME));
-        // QEMU can accept TCP before the guest boots. Abandoning that
-        // handshake could consume the guest's only hardware connection.
-        let (socket, _) = tungstenite::client::client_with_config(
-            format!("ws://{address}/v1/hw"),
-            stream,
-            Some(config),
-        )?;
-        socket.get_ref().set_read_timeout(Some(INPUT_POLL))?;
-        Ok(socket)
-    }
-
     /// Consume hardware frames and explicit inputs on one ordered connection.
-    fn serve(
-        &self,
-        mut socket: WebSocket<TcpStream>,
-        buttons: &mpsc::Receiver<Button>,
-        generation: u64,
-    ) -> Result<()> {
+    fn serve(&self, mut socket: Channel, buttons: &mpsc::Receiver<Button>) -> Result<()> {
         // This deadline dies with the connection, so it cannot release a new guest
         let mut release_at = None;
+        let mut generation = 0;
         while !self.0.stopping.load(Ordering::SeqCst) {
             // Service deadlines even while inputs or LED frames arrive continuously
             if release_at.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -396,17 +348,32 @@ impl Controller {
             }
 
             // Idle reads return frequently enough to deliver button edges and timers
-            match socket.read() {
-                Ok(Message::Text(text)) => match self.frame(text.as_str()) {
-                    Ok(Some(reply)) => socket.send(reply.into())?,
+            match socket.read(INPUT_POLL) {
+                Ok(text) if text == HELLO => {
+                    // A guest restart can reopen virtio-serial without closing QEMU's socket
+                    release_at = None;
+                    self.update(|state| {
+                        state.connected = false;
+                        state.pressed = false;
+                        state.ui_pressed = false;
+                        state.cli_pressed = false;
+                        state.phase = Phase::Booting;
+                        state.colors = [[0.0; 3]; 4];
+                        state.nameplate = Nameplate::default();
+                        state.generation += 1;
+                    });
+                    socket.send(HELLO)?;
+                    generation = self.snapshot().generation;
+                    self.update(|state| state.connected = true);
+                    log!("[hardware] connected to guest");
+                }
+                Ok(_) if generation == 0 => bail!("expected hardware version 1 greeting"),
+                Ok(text) => match self.frame(text.as_str()) {
+                    Ok(Some(reply)) => socket.send(&reply)?,
                     Ok(None) => {}
                     Err(err) => log!("[hardware] ignoring malformed frame: {err}"),
                 },
-                Ok(Message::Close(_)) => return Ok(()),
-                Ok(Message::Ping(_)) => socket.flush()?,
-                Ok(_) => {}
-                Err(tungstenite::Error::Io(err))
-                    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(err) => return Err(err.into()),
             }
         }
@@ -416,7 +383,7 @@ impl Controller {
     /// Deliver an edge before committing a hold or starting its release timer.
     fn apply_button(
         &self,
-        socket: &mut WebSocket<TcpStream>,
+        socket: &mut Channel,
         source: ButtonSource,
         held: bool,
         release_after: Option<u32>,
@@ -436,7 +403,7 @@ impl Controller {
                 "d": "button", "id": BUTTON_PIN,
                 "payload": { "edge": if pressed { "falling" } else { "rising" } }
             });
-            socket.send(frame.to_string().into())?;
+            socket.send(&frame.to_string())?;
         }
 
         // A fresh deadline starts after delivery, including a repeated timed press
@@ -528,40 +495,29 @@ struct Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use crate::ipc::local::Server;
+    use std::io::Write as _;
 
-    /// Start the production controller against a loopback hardware peer.
-    fn connect() -> (Controller, TcpListener, WebSocket<TcpStream>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// Start the production controller against a native hardware peer.
+    fn connect() -> (Controller, Server, Channel) {
+        let (endpoint, listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(listener.local_addr().unwrap());
-        let socket = tungstenite::accept(accept(&listener)).unwrap();
+        controller.start(endpoint, std::process::id());
+        let mut socket = accept(&listener);
+        socket.send(HELLO).unwrap();
+        assert_eq!(socket.read(Duration::from_secs(1)).unwrap(), HELLO);
         wait_for(&controller, |state| state.connected);
         (controller, listener, socket)
     }
 
     /// Accept the controller with a deadline so regressions cannot hang tests.
-    fn accept(listener: &TcpListener) -> TcpStream {
-        listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_millis(500)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(1)))
-                        .unwrap();
-                    return stream;
-                }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "hardware did not connect");
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(err) => panic!("accept failed: {err}"),
-            }
-        }
+    fn accept(listener: &Server) -> Channel {
+        Channel::new(
+            listener
+                .accept_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+        )
     }
 
     /// Wait for a state reached through socket traffic under a test deadline.
@@ -578,9 +534,8 @@ mod tests {
     }
 
     /// Read the next hardware reply under the carrier's response deadline.
-    fn read(socket: &mut WebSocket<TcpStream>) -> Value {
-        let frame = socket.read().unwrap();
-        serde_json::from_str(frame.to_text().unwrap()).unwrap()
+    fn read(socket: &mut Channel) -> Value {
+        serde_json::from_str(&socket.read(Duration::from_secs(1)).unwrap()).unwrap()
     }
 
     /// Boot and merge state without any frontend reading notifications.
@@ -588,7 +543,7 @@ mod tests {
     fn test_hardware_boot_and_partial_nameplates_need_no_frontend() {
         let (controller, _listener, mut socket) = connect();
         socket
-            .send(r#"{"d":"revbits","id":"i2c@0x20","payload":{"op":"read"}}"#.into())
+            .send(r#"{"d":"revbits","id":"i2c@0x20","payload":{"op":"read"}}"#)
             .unwrap();
         assert_eq!(
             read(&mut socket),
@@ -596,9 +551,9 @@ mod tests {
                 "d": "revbits", "id": "i2c@0x20", "payload": {"version": 1, "revision": 11}
             })
         );
-        socket.send(r#"{"d":"nameplate","id":"self","payload":{"env":"develop","name":"test device","serial":"test-serial","expiry":1800000000}}"#.into()).unwrap();
+        socket.send(r#"{"d":"nameplate","id":"self","payload":{"env":"develop","name":"test device","serial":"test-serial","expiry":1800000000}}"#).unwrap();
         socket
-            .send(r#"{"d":"nameplate","id":"self","payload":{"name":""}}"#.into())
+            .send(r#"{"d":"nameplate","id":"self","payload":{"name":""}}"#)
             .unwrap();
         let state = wait_for(&controller, |state| {
             state.nameplate.known && state.nameplate.name.is_none()
@@ -607,20 +562,20 @@ mod tests {
         assert_eq!(state.nameplate.serial.as_deref(), Some("test-serial"));
         assert_eq!(state.nameplate.expiry, Some(1_800_000_000));
         socket
-            .send(r#"{"d":"nameplate","id":"self","payload":{"expiry":null}}"#.into())
+            .send(r#"{"d":"nameplate","id":"self","payload":{"expiry":null}}"#)
             .unwrap();
         wait_for(&controller, |state| state.nameplate.expiry.is_none());
 
-        socket.send(r#"{"d":"rgbled","id":"0","payload":{"colors":[[0.1,0.2,0.3],[0,0,0],[1,1,1],[0.4,0,0]]}}"#.into()).unwrap();
+        socket.send(r#"{"d":"rgbled","id":"0","payload":{"colors":[[0.1,0.2,0.3],[0,0,0],[1,1,1],[0.4,0,0]]}}"#).unwrap();
         let state = wait_for(&controller, |state| state.colors[0][0] == 0.1);
         assert!(state.phase == Phase::Booting);
         socket
-            .send(r#"{"d":"switch","id":"22","payload":{"level":"high"}}"#.into())
+            .send(r#"{"d":"switch","id":"22","payload":{"level":"high"}}"#)
             .unwrap();
         let state = wait_for(&controller, |state| state.phase == Phase::Firmware);
         assert_eq!(state.colors[0], [0.1, 0.2, 0.3]);
         socket
-            .send(r#"{"d":"switch","id":"22","payload":{"level":"low"}}"#.into())
+            .send(r#"{"d":"switch","id":"22","payload":{"level":"low"}}"#)
             .unwrap();
         wait_for(&controller, |state| state.phase == Phase::Booting);
         controller.stop();
@@ -637,10 +592,10 @@ mod tests {
             r#"{"d":"rgbled","id":"0","payload":{"colors":[[1,0,0]]}}"#,
             r#"{"d":"switch","id":"99","payload":{"level":"high"}}"#,
         ] {
-            socket.send(frame.into()).unwrap();
+            socket.send(frame).unwrap();
         }
         socket
-            .send(r#"{"d":"revbits","id":"i2c@0x20","payload":{"op":"read"}}"#.into())
+            .send(r#"{"d":"revbits","id":"i2c@0x20","payload":{"op":"read"}}"#)
             .unwrap();
         read(&mut socket);
         let state = controller.snapshot();
@@ -682,10 +637,9 @@ mod tests {
             .unwrap();
         read(&mut socket);
         socket
-            .send(r#"{"d":"nameplate","id":"self","payload":{"name":"before restart"}}"#.into())
+            .send(r#"{"d":"nameplate","id":"self","payload":{"name":"before restart"}}"#)
             .unwrap();
         wait_for(&controller, |state| state.nameplate.known);
-        socket.close(None).unwrap();
         drop(socket);
         let state = wait_for(&controller, |state| !state.connected);
         assert!(!state.pressed);
@@ -696,7 +650,9 @@ mod tests {
                 .button(ButtonSource::Ui, true, generation, None)
                 .is_err()
         );
-        let mut socket = tungstenite::accept(accept(&listener)).unwrap();
+        let mut socket = accept(&listener);
+        socket.send(HELLO).unwrap();
+        assert_eq!(socket.read(Duration::from_secs(1)).unwrap(), HELLO);
         wait_for(&controller, |state| state.connected);
         assert!(
             controller
@@ -704,7 +660,7 @@ mod tests {
                 .is_err()
         );
         socket
-            .send(r#"{"d":"revbits","id":"i2c@0x20","payload":{"op":"read"}}"#.into())
+            .send(r#"{"d":"revbits","id":"i2c@0x20","payload":{"op":"read"}}"#)
             .unwrap();
         assert_eq!(read(&mut socket)["d"], "revbits");
         controller.stop();
@@ -715,18 +671,25 @@ mod tests {
         assert!(controller.snapshot().phase == Phase::Stopped);
     }
 
-    /// A pending handshake survives boot delays on QEMU's forwarded port.
+    /// A pending greeting survives guest boot delays without replacing the connection.
     #[test]
     fn test_a_pending_boot_connection_is_not_replaced() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (endpoint, listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(listener.local_addr().unwrap());
-        let stream = accept(&listener);
+        controller.start(endpoint, std::process::id());
+        let mut socket = accept(&listener);
         thread::sleep(Duration::from_millis(1200));
-        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
-        let mut socket = tungstenite::accept(stream).unwrap();
+        assert!(
+            listener
+                .accept_timeout(Duration::from_millis(20))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!controller.snapshot().connected);
+        socket.send(HELLO).unwrap();
+        assert_eq!(socket.read(Duration::from_secs(1)).unwrap(), HELLO);
         socket
-            .send(r#"{"d":"revbits","id":"i2c@0x20","payload":{"op":"read"}}"#.into())
+            .send(r#"{"d":"revbits","id":"i2c@0x20","payload":{"op":"read"}}"#)
             .unwrap();
         assert_eq!(read(&mut socket)["payload"]["revision"], 11);
         controller.stop();
@@ -736,9 +699,9 @@ mod tests {
     #[test]
     fn test_stop_interrupts_a_pending_handshake() {
         use std::io::Read as _;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (endpoint, listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(listener.local_addr().unwrap());
+        controller.start(endpoint, std::process::id());
         let mut stream = accept(&listener);
         let (done, finished) = mpsc::channel();
         let worker = controller.clone();
@@ -748,7 +711,7 @@ mod tests {
         });
         finished.recv_timeout(Duration::from_millis(500)).unwrap();
         let mut request = Vec::new();
-        stream.read_to_end(&mut request).unwrap();
+        stream.stream().read_to_end(&mut request).unwrap();
         assert!(controller.snapshot().phase == Phase::Stopped);
     }
 
@@ -779,18 +742,12 @@ mod tests {
     /// A read timeout preserves an incomplete message and still permits inputs.
     #[test]
     fn test_fragmented_frames_survive_idle_reads() {
-        use tungstenite::protocol::frame::{
-            Frame,
-            coding::{Data, OpCode},
-        };
         let (controller, _listener, mut socket) = connect();
-        socket
-            .send(Message::Frame(Frame::message(
-                br#"{"d":"revbits","id":"carrier","payload":"#.as_slice(),
-                OpCode::Data(Data::Text),
-                false,
-            )))
-            .unwrap();
+        let frame = br#"{"d":"revbits","id":"carrier","payload":{"op":"read"}}"#;
+        let mut encoded = vec![0; darkbio_cobs::encode_buffer(frame.len()) + 1];
+        let length = darkbio_cobs::encode(frame, &mut encoded).unwrap();
+        encoded.truncate(length + 1);
+        socket.stream().write_all(&encoded[..20]).unwrap();
         thread::sleep(Duration::from_millis(50));
         let reply = controller
             .enqueue_button(
@@ -805,13 +762,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(read(&mut socket)["payload"]["edge"], "falling");
-        socket
-            .send(Message::Frame(Frame::message(
-                br#"{"op":"read"}}"#.as_slice(),
-                OpCode::Data(Data::Continue),
-                true,
-            )))
-            .unwrap();
+        socket.stream().write_all(&encoded[20..]).unwrap();
         assert_eq!(read(&mut socket)["payload"]["revision"], 11);
         controller.stop();
     }
@@ -820,7 +771,7 @@ mod tests {
     #[test]
     fn test_oversized_hardware_frames_disconnect() {
         let (controller, _listener, mut socket) = connect();
-        socket.send("x".repeat(65 * 1024).into()).unwrap();
+        socket.stream().write_all(&vec![1; 65797]).unwrap();
         let state = wait_for(&controller, |state| !state.connected);
         assert!(!state.nameplate.known);
         controller.stop();

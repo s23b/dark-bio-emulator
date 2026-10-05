@@ -32,9 +32,7 @@ httparse = "1.10"
 sha2 = "0.10"
 console = "0.16"
 dirs = "6"
-tungstenite = "0.30"
-
-[dev-dependencies]
+darkbio-cobs = "1"
 tempfile = "3"
 
 # Orphan cleanup is OS-specific: PDEATHSIG (Linux) needs libc; macOS uses a

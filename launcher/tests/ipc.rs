@@ -6,6 +6,10 @@
 
 //! Native IPC regressions run on each packaging platform without a guest.
 
+#[path = "../src/ipc/hardware.rs"]
+#[allow(dead_code)] // The standalone tests omit the guest launcher.
+mod hardware;
+
 #[path = "../src/ipc/http.rs"]
 mod http;
 

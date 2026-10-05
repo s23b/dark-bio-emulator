@@ -69,12 +69,19 @@ impl Write for Stream {
 
 /// Connect within the deadline without allowing the server to act as this user.
 pub(super) fn connect(path: &Path, timeout: Duration) -> io::Result<Stream> {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    connect_with_access(path, timeout, GENERIC_READ | GENERIC_WRITE)
+}
+
+/// Open a client handle with explicit access while preserving its impersonation limit.
+fn connect_with_access(path: &Path, timeout: Duration, access: u32) -> io::Result<Stream> {
     // OpenOptions adds SECURITY_SQOS_PRESENT. Importing this handle into
     // interprocess would reopen it without retaining the impersonation limit.
     let mut options = OpenOptions::new();
     options
         .read(true)
         .write(true)
+        .access_mode(access)
         .security_qos_flags(SECURITY_IDENTIFICATION);
     let file = super::bounded(Instant::now() + timeout, || {
         options.open(path).map_err(|err| {
@@ -95,6 +102,52 @@ pub(super) fn connect(path: &Path, timeout: Duration) -> io::Result<Stream> {
         return Err(io::Error::last_os_error());
     }
     Ok(Stream::Client(file))
+}
+
+/// Verify the spawned QEMU owns this pipe and restrict it before acknowledging the guest.
+pub(super) fn connect_qemu(path: &Path, pid: u32, timeout: Duration) -> io::Result<Stream> {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_READ, GENERIC_WRITE},
+        Security::{
+            Authorization::{SE_KERNEL_OBJECT, SetSecurityInfo},
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        },
+        Storage::FileSystem::WRITE_DAC,
+        System::Pipes::GetNamedPipeServerProcessId,
+    };
+    let socket = connect_with_access(path, timeout, GENERIC_READ | GENERIC_WRITE | WRITE_DAC)?;
+    let mut server = 0;
+    // SAFETY: the pipe handle is live and server points to a writable process id
+    if unsafe { GetNamedPipeServerProcessId(socket.as_handle().as_raw_handle(), &mut server) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if server != pid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "hardware pipe belongs to another process",
+        ));
+    }
+
+    // QEMU creates its pipe with a default DACL. No driver traffic is allowed
+    // until this client restricts it and acknowledges the guest's greeting.
+    let acl = identity()?.1.dacl()?.unwrap().0;
+    // SAFETY: the descriptor and pipe remain live, and SetSecurityInfo copies the ACL
+    let status = unsafe {
+        SetSecurityInfo(
+            socket.as_handle().as_raw_handle(),
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl.cast(),
+            ptr::null(),
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(socket)
 }
 
 /// Read available bytes while distinguishing an idle pipe from a closed peer.
@@ -218,7 +271,7 @@ fn read_identity() -> io::Result<(String, SecurityDescriptor)> {
     };
 
     // A protected DACL prevents inherited access for Everyone or anonymous callers
-    let sddl: Vec<_> = format!("D:P(A;;GA;;;{text})")
+    let sddl: Vec<_> = format!("D:P(D;;GA;;;NU)(A;;GA;;;{text})")
         .encode_utf16()
         .chain(Some(0))
         .collect();

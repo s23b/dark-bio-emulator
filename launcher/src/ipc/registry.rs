@@ -414,7 +414,7 @@ mod tests {
         }
     }
 
-    /// Send a raw HTTP request through an isolated registry listener.
+    /// Send a COBS-framed HTTP request through an isolated registry listener.
     fn exchange(
         registry: &mut Registry,
         method: &str,
@@ -429,10 +429,10 @@ mod tests {
         let mut stream = local::Stream::connect(server.name(), timeout).unwrap();
         stream.set_read_timeout(timeout);
         stream.set_write_timeout(timeout);
-        write!(
-            stream,
-            "{method} {path} HTTP/1.0\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}",
-            body.len()
+        super::super::http::write_frame(
+            &mut stream,
+            format!("{method} {path} HTTP/1.0\r\nHost: {address}\r\n{headers}\r\n{body}")
+                .as_bytes(),
         )
         .unwrap();
 
@@ -442,11 +442,8 @@ mod tests {
             Err(err) if err.kind() == io::ErrorKind::InvalidData => {}
             result => panic!("request was not received: {}", result.err().unwrap()),
         }
-        let mut response = String::new();
-        if let Err(err) = stream.read_to_string(&mut response) {
-            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
-            assert!(response.contains("\r\n\r\n"));
-        }
+        let response =
+            String::from_utf8(super::super::http::read_frame(stream, 16384).unwrap()).unwrap();
         parse_reply(&response)
     }
 

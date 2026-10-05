@@ -172,17 +172,11 @@ impl Runtime {
     ) -> Result<()> {
         diagnostics::record_path("Disk", disk);
         let control = control::Control::start(self.hardware.clone(), || shut_down(0))?;
-        let mut child = spawn_qemu(
-            pending.arch,
-            &pending.firmware,
-            disk,
-            memory,
-            env,
-            pending.qemu_libs.as_deref(),
-            &mut pending.host_port,
-        )?;
+        let channel = crate::ipc::hardware::Endpoint::new()
+            .context("could not prepare the hardware channel")?;
+        let mut child = spawn_qemu(&mut pending, disk, memory, env, &channel)?;
         disk::mark_booted(disk);
-        self.hardware.start(pending.host_port.addr());
+        self.hardware.start(channel, child.id());
         if let Err(err) = discovery::register(
             pending.host_port.port(),
             disk,

@@ -507,17 +507,27 @@ fn exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::testing::response;
+    use crate::ipc::hardware::{Channel, Endpoint as HardwareEndpoint, HELLO};
     use serde_json::{Value, json};
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Instant;
-    use tungstenite::WebSocket;
+
+    /// Frame an HTTP reply for a peer that can cut its wire bytes short.
+    fn response(status: u16, body: &str) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        http::write_frame(
+            &mut encoded,
+            crate::ipc::testing::response(status, body).as_bytes(),
+        )
+        .unwrap();
+        encoded
+    }
 
     /// Serve direct control replies and release an optional guest at the end.
     fn stop_peer(
-        replies: Vec<(&'static str, String)>,
+        replies: Vec<(&'static str, Vec<u8>)>,
         guest: Option<TcpListener>,
     ) -> (Endpoint, JoinHandle<()>) {
         let endpoint = Endpoint {
@@ -541,7 +551,7 @@ mod tests {
                         .iter()
                         .any(|header| header.field.equiv("X-Ark-Generation"))
                 );
-                request.into_writer().write_all(reply.as_bytes()).unwrap();
+                request.into_writer().write_all(&reply).unwrap();
             }
             drop(guest);
         });
@@ -639,22 +649,13 @@ mod tests {
     /// Losing an accepted stop reply is resolved by status and port closure.
     #[test]
     fn test_direct_stop_confirms_a_lost_acknowledgement_without_replaying() {
-        for lost in [
-            "",
-            "H",
-            "HT",
-            "HTT",
-            "HTTP",
-            "HTTP/",
-            "HTTP/1",
-            "HTTP/1.0 202 Accepted\r\n",
-            "HTTP/1.0 202 Accepted\r\nContent-Length: 17\r\n\r\n{\"stop",
-        ] {
+        let reply = response(202, r#"{"stopping":true}"#);
+        for end in 0..reply.len() {
             let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = guest.local_addr().unwrap().port();
             let (endpoint, worker) = stop_peer(
                 vec![
-                    ("/v1/stop", lost.to_owned()),
+                    ("/v1/stop", reply[..end].to_vec()),
                     ("/v1/status", response(200, r#"{"stopping":true}"#)),
                 ],
                 Some(guest),
@@ -675,7 +676,7 @@ mod tests {
             let (endpoint, worker) = stop_peer(
                 vec![
                     ("/v1/stop", response(202, r#"{"stopping":true}"#)),
-                    ("/v1/status", reply[..end].to_owned()),
+                    ("/v1/status", reply[..end].to_vec()),
                 ],
                 Some(guest),
             );
@@ -688,16 +689,17 @@ mod tests {
     /// A launcher that never accepted a lost request is reported without replay.
     #[test]
     fn test_direct_stop_reports_an_unaccepted_lost_request() {
-        for lost in ["", "H", "HTTP/"] {
+        let reply = response(202, r#"{"stopping":true}"#);
+        for end in [0, 1, reply.len() - 1] {
             let (endpoint, worker) = stop_peer(
                 vec![
-                    ("/v1/stop", lost.to_owned()),
+                    ("/v1/stop", reply[..end].to_vec()),
                     ("/v1/status", response(200, r#"{"stopping":false}"#)),
                 ],
                 None,
             );
             let err = stop(&endpoint, 18181, Instant::now() + Duration::from_secs(3)).unwrap_err();
-            assert_eq!(err.code, Code::ControlUnreachable, "{lost:?}");
+            assert_eq!(err.code, Code::ControlUnreachable, "{end}");
             worker.join().unwrap();
         }
     }
@@ -755,7 +757,7 @@ mod tests {
                 .unwrap();
             assert_eq!(request.url(), "/v1/stop");
             let mut stream = request.into_writer();
-            for byte in response(202, r#"{"stopping":true}"#).bytes() {
+            for byte in response(202, r#"{"stopping":true}"#) {
                 if stream
                     .write_all(&[byte])
                     .and_then(|()| stream.flush())
@@ -776,9 +778,12 @@ mod tests {
     /// Malformed and refused status replies remain failures after a stop is accepted.
     #[test]
     fn test_direct_stop_keeps_status_failures_visible() {
+        let mut malformed = Vec::new();
+        http::write_frame(&mut malformed, b"HTTP/1.0 200 OK\r\n").unwrap();
         for reply in [
-            "garbage".to_owned(),
-            "HTTP?".to_owned(),
+            b"\x08garbage\0".to_vec(),
+            b"\x06HTTP?\0".to_vec(),
+            malformed,
             response(200, "not json"),
             response(503, "status unavailable"),
         ] {
@@ -790,36 +795,36 @@ mod tests {
                 None,
             );
             let err = stop(&endpoint, 18181, Instant::now() + Duration::from_secs(3)).unwrap_err();
-            assert_eq!(err.code, Code::ControlUnreachable, "{reply}");
+            assert_eq!(err.code, Code::ControlUnreachable, "{reply:?}");
             worker.join().unwrap();
         }
     }
 
-    /// A real controller, control listener and loopback guest for protocol tests.
+    /// A real controller, control listener and native guest peer for protocol tests.
     struct Fixture {
         /// The launcher side of the hardware socket.
         hardware: Controller,
-        /// Listener kept for simulated guest restarts.
-        listener: TcpListener,
+        /// Listener retaining the fake guest's native endpoint.
+        _listener: Server,
         /// Direct HTTP service exercised by the production CLI client.
         control: Control,
         /// Guest side, also used to verify exact wire edges.
-        peer: WebSocket<TcpStream>,
+        peer: Channel,
     }
 
     impl Fixture {
         /// Connect without QEMU or any frontend.
         fn new() -> Self {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let (endpoint, listener) = HardwareEndpoint::fixture();
             let hardware = Controller::default();
-            hardware.start(listener.local_addr().unwrap());
+            hardware.start(endpoint, std::process::id());
             let peer = accept(&listener);
             wait_for(|| hardware.snapshot().connected);
             let control =
                 Control::start(hardware.clone(), || panic!("unexpected shutdown")).unwrap();
             Self {
                 hardware,
-                listener,
+                _listener: listener,
                 control,
                 peer,
             }
@@ -827,8 +832,8 @@ mod tests {
 
         /// Read one expected edge within the hardware response deadline.
         fn edge(&mut self) -> String {
-            let frame = self.peer.read().unwrap();
-            let body: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            let frame = self.peer.read(Duration::from_secs(3)).unwrap();
+            let body: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(body["d"], "button");
             assert_eq!(body["id"], "5");
             body["payload"]["edge"].as_str().unwrap().to_owned()
@@ -842,20 +847,16 @@ mod tests {
     }
 
     /// Accept a hardware connection under a deadline, including the handshake.
-    fn accept(listener: &TcpListener) -> WebSocket<TcpStream> {
-        let listener = listener.try_clone().unwrap();
-        let (send, receive) = mpsc::channel();
-        thread::spawn(move || {
-            let stream = listener.accept().unwrap().0;
-            stream
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_millis(500)))
-                .unwrap();
-            let _ = send.send(tungstenite::accept(stream).unwrap());
-        });
-        receive.recv_timeout(Duration::from_secs(5)).unwrap()
+    fn accept(listener: &Server) -> Channel {
+        let mut channel = Channel::new(
+            listener
+                .accept_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+        );
+        channel.send(HELLO).unwrap();
+        assert_eq!(channel.read(Duration::from_secs(1)).unwrap(), HELLO);
+        channel
     }
 
     /// Bound asynchronous worker observations in synchronous tests.
@@ -979,11 +980,6 @@ mod tests {
         assert!(fixture.hardware.snapshot().cli_pressed);
 
         // No client remains connected while the worker delivers the release
-        fixture
-            .peer
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
         assert_eq!(fixture.edge(), "rising");
         assert!(started.elapsed() >= Duration::from_secs(1));
         wait_for(|| !fixture.hardware.snapshot().cli_pressed);
@@ -1015,11 +1011,6 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.changed);
-        fixture
-            .peer
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
         assert_eq!(fixture.edge(), "rising");
         assert!(started.elapsed() >= Duration::from_secs(2));
     }
@@ -1194,16 +1185,9 @@ mod tests {
         // Leave a timer pending across the guest restart
         button(&fixture.control.endpoint, true, Some(2), timeout).unwrap();
         assert_eq!(fixture.edge(), "falling");
-        fixture.peer.close(None).unwrap();
-        wait_for(|| !fixture.hardware.snapshot().connected);
-        assert_eq!(
-            button(&fixture.control.endpoint, false, None, timeout)
-                .unwrap_err()
-                .code,
-            Code::ButtonUnavailable
-        );
-        fixture.peer = accept(&fixture.listener);
-        wait_for(|| fixture.hardware.snapshot().connected);
+        fixture.peer.send(HELLO).unwrap();
+        assert_eq!(fixture.peer.read(Duration::from_secs(1)).unwrap(), HELLO);
+        wait_for(|| fixture.hardware.snapshot().generation != generation);
         let state = fixture.hardware.snapshot();
         assert!(!state.pressed && !state.cli_pressed && !state.ui_pressed);
         assert_eq!(
@@ -1233,16 +1217,26 @@ mod tests {
     fn test_control_rejects_bodies_and_invalid_generations() {
         let fixture = Fixture::new();
         let endpoint = &fixture.control.endpoint;
+        let generation = fixture.hardware.snapshot().generation;
+        let length = format!("X-Ark-Generation: {generation}\r\nContent-Length: 0\r\n");
+        let chunked = format!("X-Ark-Generation: {generation}\r\nTransfer-Encoding: chunked\r\n");
         for (headers, body, expected) in [
             ("", "x", 413),
+            ("", "x\0", 413),
             ("", "", 400),
             ("X-Ark-Generation: invalid\r\n", "", 400),
+            (length.as_str(), "", 400),
+            (chunked.as_str(), "", 400),
         ] {
             let mut stream = Stream::connect(&endpoint.name(), Duration::from_secs(1)).unwrap();
             stream.set_read_timeout(Duration::from_secs(1));
-            write!(stream, "POST /v1/button/press HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n{headers}\r\n{body}", body.len()).unwrap();
-            let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
+            http::write_frame(
+                &mut stream,
+                format!("POST /v1/button/press HTTP/1.0\r\nHost: localhost\r\n{headers}\r\n{body}")
+                    .as_bytes(),
+            )
+            .unwrap();
+            let response = String::from_utf8(http::read_frame(stream, 8192).unwrap()).unwrap();
             assert_eq!(
                 response
                     .split_whitespace()

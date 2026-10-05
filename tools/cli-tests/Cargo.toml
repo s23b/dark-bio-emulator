@@ -25,6 +25,7 @@ path = "../../launcher/tests/ipc.rs"
 required-features = ["packaged"]
 
 [dev-dependencies]
+darkbio-cobs = "1"
 serde_json = "1"
 tempfile = "3"
 interprocess = "2.4.4"

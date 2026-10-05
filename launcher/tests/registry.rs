@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)] // Scripted peers use the production transport without every client helper.
 mod local;
 
+#[path = "../src/ipc/http.rs"]
+#[allow(dead_code)] // Scripted peers use the production framing without the client helper.
+mod http;
+
 /// Refused initial and later publications stop the guest and reach either caller.
 #[test]
 fn test_registration_refusals_reach_standalone_and_start_commands() {

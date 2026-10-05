@@ -8,13 +8,13 @@
 //!
 //! Only native processes can reach these listeners. Unix sockets live in a
 //! private directory, and Windows pipes admit only the current user's SID.
-//! Each connection carries one bounded request and one response. HTTP framing
-//! preserves the control protocol across platforms.
+//! Each connection carries one bounded request and one response. HTTP methods,
+//! routes and status codes sit inside zero-delimited COBS messages.
 
 use std::cell::Cell;
 #[cfg(unix)]
 use std::fs::File;
-use std::io::{self, BufRead as _, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::{
     io::{AsFd as _, AsRawFd as _},
@@ -38,7 +38,7 @@ use interprocess::local_socket::{
     GenericFilePath, Listener, ListenerNonblockingMode, ListenerOptions, prelude::*,
 };
 use sha2::{Digest as _, Sha256};
-use tiny_http::{HTTPVersion, Header, Method, Response};
+use tiny_http::{Header, Method, Response};
 
 #[cfg(windows)]
 #[path = "local_windows.rs"]
@@ -73,6 +73,8 @@ pub(crate) static PROCESS_TEST: Mutex<()> = Mutex::new(());
 struct SocketFiles {
     /// Socket removed on listener drop or process exit.
     path: PathBuf,
+    /// Whether the socket's parent is a private directory owned by this endpoint.
+    remove_directory: bool,
     /// Whether a fixture created the lock while exclusively reserving its name.
     #[cfg(test)]
     remove_lock: bool,
@@ -83,6 +85,9 @@ impl SocketFiles {
     /// Remove the socket and any lock owned exclusively by a fixture.
     fn remove(&self) {
         let _ = std::fs::remove_file(&self.path);
+        if self.remove_directory {
+            let _ = std::fs::remove_dir(self.path.parent().unwrap());
+        }
         #[cfg(test)]
         if self.remove_lock {
             let _ = std::fs::remove_file(self.path.with_extension("lock"));
@@ -106,7 +111,7 @@ pub(crate) fn identity() -> String {
 }
 
 /// Resolve a protocol name within the current user's local IPC namespace.
-fn address(name: &str) -> io::Result<PathBuf> {
+pub(crate) fn address(name: &str) -> io::Result<PathBuf> {
     if name.is_empty()
         || name.len() > 70
         || !name
@@ -147,6 +152,11 @@ impl Stream {
     /// Connect to a native endpoint without consulting proxies or DNS.
     pub(crate) fn connect(name: &str, timeout: Duration) -> io::Result<Self> {
         let path = address(name)?;
+        Self::connect_path(&path, timeout)
+    }
+
+    /// Connect to a private endpoint supplied directly by the launcher.
+    pub(crate) fn connect_path(path: &std::path::Path, timeout: Duration) -> io::Result<Self> {
         #[cfg(unix)]
         verify_directory(path.parent().unwrap())?;
         #[cfg(unix)]
@@ -156,8 +166,21 @@ impl Stream {
             .nonblocking_stream(true)
             .connect_sync()?;
         #[cfg(windows)]
-        let socket = windows::connect(&path, timeout)?;
+        let socket = windows::connect(path, timeout)?;
         Ok(Self::new(socket, timeout))
+    }
+
+    /// Connect to the spawned QEMU pipe and restrict it before hardware negotiation.
+    #[cfg(windows)]
+    pub(crate) fn connect_qemu(
+        path: &std::path::Path,
+        pid: u32,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        Ok(Self::new(
+            windows::connect_qemu(path, pid, timeout)?,
+            timeout,
+        ))
     }
 
     /// Wrap an accepted nonblocking connection with bounded I/O.
@@ -291,7 +314,7 @@ impl Server {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            track_socket(path.clone())?;
+            track_socket(path.clone(), false)?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
         Ok(server)
@@ -348,6 +371,11 @@ impl Server {
 
     /// Bound the idle accept wait and the subsequent request read independently.
     pub(crate) fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<Request>> {
+        self.accept_timeout(timeout)?.map(Request::read).transpose()
+    }
+
+    /// Accept a bounded native stream without imposing HTTP framing.
+    pub(crate) fn accept_timeout(&self, timeout: Duration) -> io::Result<Option<Stream>> {
         let deadline = Instant::now() + timeout;
         loop {
             if self.stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
@@ -357,7 +385,7 @@ impl Server {
                 Ok(socket) => {
                     #[cfg(windows)]
                     let socket = Socket::Server(socket);
-                    return Request::read(Stream::new(socket, IO_TIMEOUT)).map(Some);
+                    return Ok(Some(Stream::new(socket, IO_TIMEOUT)));
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     if let Err(err) = self.wait(deadline)
@@ -436,21 +464,14 @@ impl Drop for Server {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Ok(path) = address(&self.name) {
-            let mut sockets = SOCKETS.lock().unwrap();
-            if let Some(sockets) = sockets.as_mut()
-                && let Some(index) = sockets.iter().position(|socket| socket.path == path)
-            {
-                sockets.swap_remove(index).remove();
-            } else {
-                let _ = std::fs::remove_file(path);
-            }
+            remove_socket(&path);
         }
     }
 }
 
 /// Register a bound socket for cleanup on normal process exit.
 #[cfg(unix)]
-fn track_socket(path: PathBuf) -> io::Result<()> {
+pub(crate) fn track_socket(path: PathBuf, remove_directory: bool) -> io::Result<()> {
     let mut sockets = SOCKETS.lock().unwrap();
     if sockets.is_none() {
         // process::exit skips destructors, including those in registry worker threads
@@ -462,10 +483,24 @@ fn track_socket(path: PathBuf) -> io::Result<()> {
     }
     sockets.as_mut().unwrap().push(SocketFiles {
         path,
+        remove_directory,
         #[cfg(test)]
         remove_lock: false,
     });
     Ok(())
+}
+
+/// Remove an owned socket and release its process-exit cleanup record.
+#[cfg(unix)]
+pub(crate) fn remove_socket(path: &std::path::Path) {
+    let mut sockets = SOCKETS.lock().unwrap();
+    if let Some(sockets) = sockets.as_mut()
+        && let Some(index) = sockets.iter().position(|socket| socket.path == path)
+    {
+        sockets.swap_remove(index).remove();
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Remove owned endpoints without waiting for another thread during process exit.
@@ -566,34 +601,30 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    /// Parse one HTTP/1.0 request under fixed size and time limits.
-    fn read(stream: Stream) -> io::Result<Self> {
-        let mut reader = BufReader::new(stream);
-        let mut head = Vec::new();
-        loop {
-            let available = reader.fill_buf()?;
-            if available.is_empty() {
-                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+    /// Parse one COBS-framed HTTP/1.0 request under size and time limits.
+    fn read(mut stream: Stream) -> io::Result<Self> {
+        let raw = match super::http::read_frame(&mut stream, 2 * MAX_REQUEST) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                return Self::reject(stream, 400);
             }
-            let count = available
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(available.len(), |index| index + 1);
-            if head.len() + count > MAX_REQUEST {
-                return Self::reject(reader.into_inner(), 413);
-            }
-            head.extend_from_slice(&available[..count]);
-            reader.consume(count);
-            if head.ends_with(b"\r\n\r\n") {
-                break;
-            }
+            Err(err) => return Err(err),
+        };
+        let Some(split) = raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            return Self::reject(stream, 400);
+        };
+        let split = split + 4;
+        if split > MAX_REQUEST || raw.len() - split > MAX_REQUEST {
+            return Self::reject(stream, 413);
         }
         let mut fields = [httparse::EMPTY_HEADER; 32];
         let mut parsed = httparse::Request::new(&mut fields);
-        if !matches!(parsed.parse(&head), Ok(httparse::Status::Complete(_)))
-            || parsed.version != Some(0)
+        if !matches!(
+            parsed.parse(&raw[..split]),
+            Ok(httparse::Status::Complete(_))
+        ) || parsed.version != Some(0)
         {
-            return Self::reject(reader.into_inner(), 400);
+            return Self::reject(stream, 400);
         }
         let method = parsed
             .method
@@ -602,46 +633,31 @@ impl Request {
             .map_err(|()| io::Error::from(io::ErrorKind::InvalidData))?;
         let path = parsed.path.unwrap().to_owned();
         let mut headers = Vec::new();
-        let mut length = None;
         for field in parsed.headers {
-            if field.name.eq_ignore_ascii_case("Transfer-Encoding") {
-                return Self::reject(reader.into_inner(), 413);
-            }
-            if field.name.eq_ignore_ascii_case("Content-Length") {
-                if length.is_some() {
-                    return Self::reject(reader.into_inner(), 400);
-                }
-                length = std::str::from_utf8(field.value)
-                    .ok()
-                    .and_then(|value| value.parse::<usize>().ok());
-                if length.is_none() {
-                    return Self::reject(reader.into_inner(), 400);
-                }
-                if length.unwrap() > MAX_REQUEST {
-                    return Self::reject(reader.into_inner(), 413);
-                }
+            if field.name.eq_ignore_ascii_case("Transfer-Encoding")
+                || field.name.eq_ignore_ascii_case("Content-Length")
+            {
+                return Self::reject(stream, 400);
             }
             headers.push(
                 Header::from_bytes(field.name, field.value)
                     .map_err(|()| io::Error::from(io::ErrorKind::InvalidData))?,
             );
         }
-        let mut body = vec![0; length.unwrap_or(0)];
-        reader.read_exact(&mut body)?;
         Ok(Self {
             method,
             path,
             headers,
-            body,
-            stream: reader.into_inner(),
+            body: raw[split..].to_vec(),
+            stream,
         })
     }
 
     /// Reject framing before dispatching anything to an application handler.
     fn reject(mut stream: Stream, status: u16) -> io::Result<Self> {
-        let _ = write!(
-            stream,
-            "HTTP/1.0 {status} Rejected\r\nContent-Length: 0\r\n\r\n"
+        let _ = super::http::write_frame(
+            &mut stream,
+            format!("HTTP/1.0 {status} Rejected\r\n\r\n").as_bytes(),
         );
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -665,10 +681,24 @@ impl Request {
     pub(crate) fn body(&self) -> &[u8] {
         &self.body
     }
-    /// Send an HTTP response and release the native connection.
-    pub(crate) fn respond<R: Read>(self, response: Response<R>) -> io::Result<()> {
+    /// Send a COBS-framed HTTP response and release the native connection.
+    pub(crate) fn respond<R: Read>(mut self, response: Response<R>) -> io::Result<()> {
+        let status = response.status_code();
+        let mut raw = format!(
+            "HTTP/1.0 {} {}\r\n",
+            status.0,
+            status.default_reason_phrase()
+        )
+        .into_bytes();
+        for header in response.headers() {
+            if !header.field.equiv("Content-Length") && !header.field.equiv("Transfer-Encoding") {
+                write!(raw, "{header}\r\n")?;
+            }
+        }
+        raw.extend_from_slice(b"\r\n");
+        response.into_reader().read_to_end(&mut raw)?;
         self.stream.set_write_timeout(IO_TIMEOUT);
-        response.raw_print(self.stream, HTTPVersion(1, 0), &self.headers, false, None)
+        super::http::write_frame(&mut self.stream, &raw)
     }
     /// Expose the response stream to scripted peers testing partial replies.
     #[cfg(test)]
@@ -694,12 +724,10 @@ mod tests {
             request.respond(Response::from_string("accepted")).unwrap();
         });
         let mut client = Stream::connect(&name, IO_TIMEOUT).unwrap();
-        client
-            .write_all(b"GET /test HTTP/1.0\r\nContent-Length: 0\r\n\r\n")
-            .unwrap();
-        let mut reply = String::new();
-        client.read_to_string(&mut reply).unwrap();
-        assert!(reply.ends_with("\r\n\r\naccepted"), "{reply:?}");
+        super::super::http::write_frame(&mut client, b"GET /test HTTP/1.0\r\n\r\n").unwrap();
+        let reply = super::super::http::read_frame(client, 8192).unwrap();
+        assert!(reply.ends_with(b"\r\n\r\naccepted"), "{reply:?}");
+        assert!(!reply.windows(14).any(|bytes| bytes == b"Content-Length"));
         worker.join().unwrap();
     }
 
@@ -938,7 +966,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         drop(stalled);
         let mut next = Stream::connect(&name, IO_TIMEOUT).unwrap();
-        next.write_all(b"GET /next HTTP/1.0\r\n\r\n").unwrap();
+        super::super::http::write_frame(&mut next, b"GET /next HTTP/1.0\r\n\r\n").unwrap();
         assert_eq!(server.recv().unwrap().url(), "/next");
     }
 
@@ -948,7 +976,7 @@ mod tests {
         let name = format!("t-{}", identity());
         let server = Server::bind(&name).unwrap();
         let mut client = Stream::connect(&name, IO_TIMEOUT).unwrap();
-        client.write_all(b"GET /test HTTP/1.0\r\n\r\n").unwrap();
+        super::super::http::write_frame(&mut client, b"GET /test HTTP/1.0\r\n\r\n").unwrap();
         let mut reply = server.recv().unwrap().into_writer();
 
         // An open pipe with no response bytes is idle, not at EOF

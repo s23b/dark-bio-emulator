@@ -13,8 +13,8 @@
 //! runs under TCG emulation and always needs a QEMU on `PATH`.
 //!
 //! The guest is minimal on purpose: virtio net and block, no monitor and no
-//! graphics. One host port forwarded through SLIRP is the entire interface the
-//! UI and any host-side client talk to.
+//! graphics. USB uses one host port forwarded through SLIRP. Hardware uses a
+//! dedicated virtio-serial device connected to private host IPC.
 //!
 //! A bundled firmware boots with its serial console attached to a null
 //! device, so the guest's output goes nowhere and stdout stays empty. A
@@ -37,7 +37,7 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::bundle::{Firmware, resolve_sidecar};
+use crate::bundle::resolve_sidecar;
 use crate::diagnostics::{self, log};
 use crate::platform::orphan;
 use crate::platform::{
@@ -332,14 +332,16 @@ pub(crate) fn create_disk(path: &Path, qemu_libs: Option<&Path>) -> Result<()> {
 /// sidecar API, which exposes no pre-exec hook, and the Linux orphan
 /// protection needs one to arm `PR_SET_PDEATHSIG`.
 pub(crate) fn spawn_qemu(
-    arch: GuestArch,
-    firmware: &Firmware,
+    pending: &mut super::Pending,
     disk: &Path,
     memory: u32,
     env: &str,
-    qemu_libs: Option<&Path>,
-    host_port: &mut HostPort,
+    hardware: &crate::ipc::hardware::Endpoint,
 ) -> Result<Child> {
+    let arch = pending.arch;
+    let firmware = &pending.firmware;
+    let qemu_libs = pending.qemu_libs.as_deref();
+    let host_port = &mut pending.host_port;
     let native = arch.host();
     let qemu = resolve_qemu(arch);
     let origin = if qemu.bundled { "bundled" } else { "on PATH" };
@@ -400,6 +402,15 @@ pub(crate) fn spawn_qemu(
             disk.display()
         ))
         .args(["-device", "virtio-blk-pci,drive=disk0", "-monitor", "none"]);
+
+    // Hardware uses a private virtio port; the serial console retains stdio
+    cmd.arg("-chardev")
+        .arg(hardware.chardev())
+        .args(["-device", "virtio-serial-pci", "-device"])
+        .arg(format!(
+            "virtserialport,chardev=hw,name={}",
+            crate::ipc::hardware::PORT_NAME
+        ));
 
     // -nographic would otherwise hand the serial device to stdio, so a build
     // that wants nothing printed points it at a null device instead. The

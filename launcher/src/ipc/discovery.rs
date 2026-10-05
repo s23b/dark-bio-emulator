@@ -5,7 +5,7 @@
 // license that can be found in the LICENSE file.
 
 //! The launcher's side of the registry: reading it, keeping this emulator's
-//! entry in it up to date, and bounded HTTP framing over private local IPC.
+//! entry in it up to date, and COBS-framed HTTP messages over private local IPC.
 //!
 //! A refused connection means no registry is running. Connection loss can
 //! recover through host takeover; HTTP refusals, timeouts and malformed replies
@@ -442,7 +442,13 @@ mod tests {
         .unwrap();
         let mut reply = Vec::new();
         browser.read_to_end(&mut reply).unwrap();
-        let public = parse_listing(&http::parse_response(&reply).unwrap().body).unwrap();
+        let split = reply
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert!(reply.starts_with(b"HTTP/1.0 200 "));
+        let public = parse_listing(&reply[split..]).unwrap();
         assert_eq!(public.len(), 1);
         assert_eq!(public[0].disk, listing[0].disk);
     }
@@ -459,7 +465,9 @@ mod tests {
             let heartbeat = server.recv().unwrap();
             assert_eq!(heartbeat.method().as_str(), "POST");
             let mut writer = heartbeat.into_writer();
-            writer.write_all(b"HTTP/1.0 204 No Content\r\n").unwrap();
+            writer
+                .write_all(b"\x1cHTTP/1.0 204 No Content\r\n")
+                .unwrap();
             drop(server);
             drop(reservation);
         });

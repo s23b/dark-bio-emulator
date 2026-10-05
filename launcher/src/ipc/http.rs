@@ -4,13 +4,55 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Bounded HTTP exchanges over native IPC, leaving retries to each caller.
+//! COBS-framed HTTP messages over native IPC, leaving retries to each caller.
 
 use std::fmt::Write as _;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read, Write};
 use std::time::Instant;
 
+use darkbio_cobs as cobs;
+
 use super::local::Stream;
+
+/// Read one zero-delimited COBS message, bounding encoded and decoded sizes.
+pub(super) fn read_frame(stream: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let encoded_limit = cobs::encode_buffer(limit);
+    let mut encoded = Vec::new();
+    BufReader::new(stream)
+        .take(encoded_limit as u64 + 1)
+        .read_until(0, &mut encoded)?;
+    if encoded.last() != Some(&0) {
+        return Err(io::Error::new(
+            if encoded.len() > encoded_limit {
+                io::ErrorKind::InvalidData
+            } else {
+                io::ErrorKind::UnexpectedEof
+            },
+            "unterminated local COBS message",
+        ));
+    }
+    encoded.pop();
+    let mut raw = vec![0; cobs::decode_buffer(encoded.len())];
+    let length = cobs::decode(&encoded, &mut raw)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if length == 0 || length > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid local message size",
+        ));
+    }
+    raw.truncate(length);
+    Ok(raw)
+}
+
+/// Send one complete native message with a zero delimiter.
+pub(super) fn write_frame(mut stream: impl Write, raw: &[u8]) -> io::Result<()> {
+    let mut encoded = vec![0; cobs::encode_buffer(raw.len()) + 1];
+    let length = cobs::encode(raw, &mut encoded)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    encoded[length] = 0;
+    stream.write_all(&encoded[..=length])
+}
 
 /// A complete response whose status is interpreted by the calling operation.
 #[derive(Debug)]
@@ -32,10 +74,7 @@ pub(super) fn exchange(
     max_response: u64,
 ) -> io::Result<Response> {
     // Request components come from fixed routes and validated caller metadata
-    let mut head = format!(
-        "{method} {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
-        body.map_or(0, <[u8]>::len)
-    );
+    let mut head = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n");
     if body.is_some() {
         head.push_str("Content-Type: application/json\r\n");
     }
@@ -48,32 +87,19 @@ pub(super) fn exchange(
     let remaining = deadline.saturating_duration_since(Instant::now());
     stream.set_write_timeout(remaining);
     stream.set_read_timeout(remaining);
-    stream.write_all(head.as_bytes())?;
+    let mut raw = head.into_bytes();
     if let Some(body) = body {
-        stream.write_all(body)?;
+        raw.extend_from_slice(body);
     }
-    let mut raw = Vec::new();
-    stream.take(max_response + 1).read_to_end(&mut raw)?;
-    if raw.len() as u64 > max_response {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "local HTTP response exceeded its size limit",
-        ));
-    }
+    write_frame(&mut stream, &raw)?;
+    let raw = read_frame(stream, max_response as usize)?;
     parse_response(&raw)
 }
 
-/// Decode response framing while distinguishing interrupted and malformed replies.
+/// Parse a complete framed response without a second body framing scheme.
 pub(super) fn parse_response(raw: &[u8]) -> io::Result<Response> {
-    // Distinguish a peer exiting during its reply from a non-HTTP response
     let split = match raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
         Some(split) => split + 4,
-        None if raw.starts_with(b"HTTP/1.") || b"HTTP/1.".starts_with(raw) => {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the peer closed during its HTTP response headers",
-            ));
-        }
         None => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -95,53 +121,20 @@ pub(super) fn parse_response(raw: &[u8]) -> io::Result<Response> {
         ));
     }
 
-    // One unencoded body ends at EOF and must match any declared length
-    let mut length = None;
+    // The COBS delimiter defines the body boundary
     for header in response.headers.iter() {
-        if header.name.eq_ignore_ascii_case("Transfer-Encoding") {
+        if header.name.eq_ignore_ascii_case("Transfer-Encoding")
+            || header.name.eq_ignore_ascii_case("Content-Length")
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "encoded local HTTP response",
-            ));
-        }
-        if header.name.eq_ignore_ascii_case("Content-Length") {
-            if length.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "duplicate local HTTP response length",
-                ));
-            }
-            length = Some(
-                std::str::from_utf8(header.value)
-                    .ok()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid local HTTP response length",
-                        )
-                    })?,
-            );
-        }
-    }
-    let body = &raw[split..];
-    if let Some(length) = length {
-        if body.len() < length {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the peer closed during its HTTP response body",
-            ));
-        }
-        if body.len() != length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "incorrect local HTTP response length",
+                "unsupported local HTTP framing header",
             ));
         }
     }
     Ok(Response {
         status: response.code.unwrap(),
-        body: body.to_vec(),
+        body: raw[split..].to_vec(),
     })
 }
 
@@ -153,16 +146,71 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// Native readers share COBS vectors, including zeros and malformed blocks.
+    #[test]
+    fn test_frame_vectors() {
+        for (wire, raw) in [
+            (
+                b"\x0e{\"version\":1}\0".as_slice(),
+                b"{\"version\":1}".as_slice(),
+            ),
+            (b"\x05\"\xc3\xa9\"\0", b"\"\xc3\xa9\""),
+            (b"\x03ab\x03cd\0", b"ab\0cd"),
+        ] {
+            assert_eq!(read_frame(wire, 64).unwrap(), raw);
+            let mut encoded = Vec::new();
+            write_frame(&mut encoded, raw).unwrap();
+            assert_eq!(encoded, wire);
+        }
+        for wire in [b"\0".as_slice(), b"\x01\0", b"\x03A\0"] {
+            assert_eq!(
+                read_frame(wire, 64).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for wire in [b"".as_slice(), b"\x0e{\"version\":1}", b"\x03A"] {
+            assert_eq!(
+                read_frame(wire, 64).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    /// Both decoded overflow and an unbounded delimiter-free stream are refused.
+    #[test]
+    fn test_frame_limits() {
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &[b'x'; 1024]).unwrap();
+        assert_eq!(read_frame(encoded.as_slice(), 1024).unwrap(), [b'x'; 1024]);
+        for wire in [encoded, [vec![1; 1026], vec![0]].concat(), vec![1; 1030]] {
+            assert_eq!(
+                read_frame(wire.as_slice(), 1023).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    /// A complete frame is readable before its peer closes the connection.
+    #[test]
+    fn test_frame_completion_does_not_wait_for_eof() {
+        let server = Server::bind(&format!("t-{}", local::identity())).unwrap();
+        let mut stream = Stream::connect(server.name(), Duration::from_secs(1)).unwrap();
+        write_frame(&mut stream, b"GET /test HTTP/1.0\r\n\r\n").unwrap();
+        let mut peer = server.recv().unwrap().into_writer();
+        write_frame(&mut peer, b"HTTP/1.0 200 OK\r\n\r\n{}\0").unwrap();
+        assert_eq!(
+            read_frame(stream, 8192).unwrap(),
+            b"HTTP/1.0 200 OK\r\n\r\n{}\0"
+        );
+        drop(peer);
+    }
+
     /// Complete replies preserve their status and body for the calling operation.
     #[test]
     fn test_complete_responses() {
         for (raw, status, body) in [
             ("HTTP/1.0 204 No Content\r\n\r\n", 204, ""),
-            (
-                "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}",
-                200,
-                "{\"a\":1}",
-            ),
+            ("HTTP/1.1 200 OK\r\n\r\n{\"a\":1}", 200, "{\"a\":1}"),
             (
                 "HTTP/1.0 400 Bad Request\r\n\r\ninvalid input",
                 400,
@@ -178,9 +226,10 @@ mod tests {
     /// Connection loss is recognizable at every boundary of the headers and body.
     #[test]
     fn test_truncated_responses() {
-        let reply = b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
+        let mut reply = Vec::new();
+        write_frame(&mut reply, b"HTTP/1.0 200 OK\r\n\r\n{\"a\":1}").unwrap();
         for end in 0..reply.len() {
-            let err = parse_response(&reply[..end]).unwrap_err();
+            let err = read_frame(&reply[..end], 8192).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{end}");
         }
     }
@@ -191,8 +240,10 @@ mod tests {
         for reply in [
             "garbage",
             "HTTP?",
+            "HTTP/1.0 200 OK\r\n",
             "HTTP/1.0 invalid\r\n\r\n",
             "HTTP/1.0 999 Unknown\r\n\r\n",
+            "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n",
             "HTTP/1.0 200 OK\r\nContent-Length: invalid\r\n\r\n",
             "HTTP/1.0 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
             "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\nextra",
@@ -206,7 +257,7 @@ mod tests {
     /// Native exchanges preserve request metadata and enforce the total reply limit.
     #[test]
     fn test_exchange_framing_and_response_limit() {
-        let response = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        let response = b"HTTP/1.0 200 OK\r\n\r\n{}";
         let body = "{\"disk\":\"démo.ark\"}".as_bytes();
         for limit in [response.len() as u64, response.len() as u64 - 1] {
             // Inspect bytes received by the peer before returning a fixed response
@@ -234,7 +285,13 @@ mod tests {
                         .any(|header| header.field.equiv("X-Ark-Generation")
                             && header.value.as_str() == "42")
                 );
-                request.into_writer().write_all(response).unwrap();
+                assert!(
+                    request
+                        .headers()
+                        .iter()
+                        .all(|header| !header.field.equiv("Content-Length"))
+                );
+                write_frame(request.into_writer(), response).unwrap();
             });
             // Accept a reply exactly at the limit and reject one byte beyond it
             let reply = exchange(

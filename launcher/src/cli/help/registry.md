@@ -18,7 +18,12 @@ routes are absent from this listener, regardless of the request headers.
 
 ## Native transport
 
-Native tools use HTTP/1.0 over local IPC, with one request per connection.
+Native tools use COBS-framed HTTP/1.0 messages over local IPC, with one request
+and one response per connection. Each message contains the HTTP start line,
+headers, a blank line and the body, encoded with `darkbio-cobs` and terminated
+by a zero byte. The delimiter ends the body; Content-Length and
+Transfer-Encoding headers are rejected.
+
 The registry endpoint is named `registry-18180`. Each launch's control
 endpoint is named `c-ID`, where ID is its advertised launch id.
 
@@ -42,8 +47,7 @@ The native registry serves these routes:
     DELETE /v1/instances/<port>   a launcher withdrawing itself
 
 Access control belongs to the socket or pipe. Headers and bodies are each
-bounded to 8 KiB, and oversized requests answer 413. Native endpoints do not
-serve browser preflights.
+bounded to 8 KiB. Native endpoints do not serve browser preflights.
 
 Publishing and withdrawing answer 204 with no body. All running launchers
 must support native IPC; restart them after updating.
@@ -71,13 +75,22 @@ must support native IPC; restart them after updating.
 `version` is 1. Read fields you know and ignore the rest.
 
 `port` identifies the emulator and is what a client dials.
-`ws://127.0.0.1:PORT/v1/usb` is the Ark's own bus and `/v1/hw` the device
-face. `disk` is the image's file name and `disk_id` an opaque digest of where
+`ws://127.0.0.1:PORT/v1/usb` is the Ark's own bus. Hardware traffic uses a
+private virtio-serial channel; the network listener has no hardware route.
+`disk` is the image's file name and `disk_id` an opaque digest of where
 it lives, which lets two launchers agree on an image without anybody
 publishing a path. No path is ever published, since any page in any browser
 can read a loopback port.
 
 The Rust launcher owns the hardware connection in both window modes.
+The guest's `bio.dark.hw.v1` port connects through a private Unix socket or
+Windows named pipe. Each JSON message is COBS encoded and terminated by a zero
+byte, with a 64 KiB limit on the decoded message. The guest begins each
+session with `{"version":1}` and waits for the same acknowledgement before
+sending driver messages. A fresh greeting clears hardware state and advances
+the connection generation.
+The firmware's serial console remains a separate device.
+
 An optional `control` object contains an opaque launch `id` naming its native
 endpoint. It carries no TCP port or filesystem path. A missing object makes
 control unavailable and requires an update and restart.
