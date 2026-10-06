@@ -12,7 +12,7 @@
 //! one a packaged build ships a QEMU for. A cross-architecture guest always
 //! runs under TCG emulation and always needs a QEMU on `PATH`.
 //!
-//! The guest is minimal on purpose: virtio net and block, no monitor and no
+//! The guest is minimal on purpose: virtio net and block, no interactive monitor and no
 //! graphics. USB uses one host port forwarded through SLIRP. Hardware uses a
 //! dedicated virtio-serial device connected to private host IPC.
 //!
@@ -337,6 +337,7 @@ pub(crate) fn spawn_qemu(
     memory: u32,
     env: &str,
     hardware: &crate::ipc::hardware::Endpoint,
+    monitor: &crate::ipc::hardware::Endpoint,
 ) -> Result<Child> {
     let arch = pending.arch;
     let firmware = &pending.firmware;
@@ -403,12 +404,17 @@ pub(crate) fn spawn_qemu(
         ))
         .args(["-device", "virtio-blk-pci,drive=disk0", "-monitor", "none"]);
 
+    // The private monitor reports guest port closure independently of its socket
+    cmd.arg("-chardev")
+        .arg(monitor.chardev())
+        .args(["-mon", "chardev=qmp,mode=control"]);
+
     // Hardware uses a private virtio port; the serial console retains stdio
     cmd.arg("-chardev")
         .arg(hardware.chardev())
         .args(["-device", "virtio-serial-pci", "-device"])
         .arg(format!(
-            "virtserialport,chardev=hw,name={}",
+            "virtserialport,id=hw,chardev=hw,name={}",
             crate::ipc::hardware::PORT_NAME
         ));
 

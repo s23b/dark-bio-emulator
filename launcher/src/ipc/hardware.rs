@@ -8,9 +8,9 @@
 //!
 //! Each UTF-8 message is COBS encoded and terminated by a zero byte.
 //! Decoded messages are bounded to 64 KiB.
-//! The guest starts each session with {"version":1}; the launcher acknowledges
-//! that message before either side sends driver frames. A new greeting resets
-//! the connection generation even when QEMU keeps the host channel open.
+//! The guest starts each session with a version 1 greeting and a fresh nonce.
+//! The launcher echoes that message before either side sends driver frames.
+//! A leading zero separates each greeting from stale partial frames.
 
 use darkbio_cobs as cobs;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
@@ -23,15 +23,30 @@ use super::local::{self, Stream};
 pub(crate) const MAX_FRAME: usize = 64 * 1024;
 /// Maximum encoded frame length before its zero delimiter.
 const MAX_ENCODED: usize = cobs::encode_buffer(MAX_FRAME);
-/// Session greeting and acknowledgement, sent before driver traffic.
-pub(crate) const HELLO: &str = r#"{"version":1}"#;
+/// Sample greeting used by native peers in protocol tests.
+#[cfg(test)]
+pub(crate) const HELLO: &str = r#"{"version":1,"session":"0123456789abcdef0123456789abcdef"}"#;
 /// Name exposed inside the guest by the dedicated virtio-serial port.
 pub(crate) const PORT_NAME: &str = "bio.dark.hw.v1";
 /// Maximum duration of one complete frame write.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// One launch's private QEMU channel, retained until its hardware worker exits.
+/// A frame size violation that requires closing the channel rather than resynchronizing.
+#[derive(Debug)]
+pub(crate) struct FrameTooLarge;
+
+impl std::fmt::Display for FrameTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("hardware frame too large")
+    }
+}
+
+impl std::error::Error for FrameTooLarge {}
+
+/// One private QEMU hardware or monitor channel, retained until its worker exits.
 pub(crate) struct Endpoint {
+    /// QEMU character backend identifier.
+    id: &'static str,
     /// Filesystem socket or fully qualified Windows pipe name.
     path: PathBuf,
     /// Private directory prevents access before QEMU creates its socket.
@@ -41,7 +56,7 @@ pub(crate) struct Endpoint {
 
 impl Endpoint {
     /// Reserve an isolated channel name before spawning QEMU.
-    pub(crate) fn new() -> io::Result<Self> {
+    pub(crate) fn new(id: &'static str) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -51,6 +66,7 @@ impl Endpoint {
                 .tempdir_in("/tmp")?;
             local::track_socket(directory.path().join("hw.sock"), true)?;
             Ok(Self {
+                id,
                 path: directory.path().join("hw.sock"),
                 _directory: directory,
             })
@@ -58,6 +74,7 @@ impl Endpoint {
         #[cfg(windows)]
         {
             Ok(Self {
+                id,
                 path: PathBuf::from(format!(r"\\.\pipe\ark-hw-{}", local::identity())),
             })
         }
@@ -68,14 +85,16 @@ impl Endpoint {
         #[cfg(unix)]
         {
             format!(
-                "socket,id=hw,path={},server=on,wait=off",
+                "socket,id={},path={},server=on,wait=off",
+                self.id,
                 self.path.display()
             )
         }
         #[cfg(windows)]
         {
             format!(
-                "pipe,id=hw,path={}",
+                "pipe,id={},path={}",
+                self.id,
                 self.path
                     .to_str()
                     .unwrap()
@@ -86,20 +105,18 @@ impl Endpoint {
     }
 
     /// Open QEMU's endpoint without exposing a TCP fallback.
-    pub(crate) fn connect(&self, pid: u32, timeout: Duration) -> io::Result<Channel> {
+    pub(crate) fn connect(&self, pid: u32, timeout: Duration) -> io::Result<Stream> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = pid;
             let stream = Stream::connect_path(&self.path, timeout)?;
             std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
-            Ok(Channel::new(stream))
+            Ok(stream)
         }
         #[cfg(windows)]
         {
-            Ok(Channel::new(Stream::connect_qemu(
-                &self.path, pid, timeout,
-            )?))
+            Stream::connect_qemu(&self.path, pid, timeout)
         }
     }
 
@@ -108,7 +125,7 @@ impl Endpoint {
     pub(crate) fn fixture() -> (Self, local::Server) {
         let name = format!("t-{}", local::identity());
         let server = local::Server::bind(&name).unwrap();
-        let mut endpoint = Self::new().unwrap();
+        let mut endpoint = Self::new("hw").unwrap();
         endpoint.path = local::address(&name).unwrap();
         (endpoint, server)
     }
@@ -148,8 +165,10 @@ impl Channel {
             .take(remaining as u64)
             .read_until(0, &mut self.encoded)?;
         if self.encoded.last() != Some(&0) {
-            return Err(if self.encoded.len() > MAX_ENCODED {
-                io::Error::new(io::ErrorKind::InvalidData, "hardware frame too large")
+            let oversized = self.encoded.len() > MAX_ENCODED;
+            self.encoded.clear();
+            return Err(if oversized {
+                io::Error::new(io::ErrorKind::InvalidData, FrameTooLarge)
             } else {
                 io::ErrorKind::UnexpectedEof.into()
             });
@@ -158,10 +177,13 @@ impl Channel {
         // Decode only a complete frame, leaving any following frames in the reader
         self.encoded.pop();
         let mut body = vec![0; cobs::decode_buffer(self.encoded.len())];
-        let length = cobs::decode(&self.encoded, &mut body)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let length = cobs::decode(&self.encoded, &mut body);
         self.encoded.clear();
-        if length == 0 || length > MAX_FRAME {
+        let length = length.map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if length > MAX_FRAME {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, FrameTooLarge));
+        }
+        if length == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid hardware frame length",
@@ -188,6 +210,13 @@ impl Channel {
         stream.write_all(&encoded[..=length])
     }
 
+    /// Terminate stale partial input before acknowledging a fresh session.
+    pub(crate) fn synchronize(&mut self, greeting: &str) -> io::Result<()> {
+        self.stream.get_mut().set_write_timeout(WRITE_TIMEOUT);
+        self.stream.get_mut().write_all(&[0])?;
+        self.send(greeting)
+    }
+
     /// Borrow the transport to exercise fragmentation and framing errors.
     #[cfg(test)]
     pub(crate) fn stream(&mut self) -> &mut Stream {
@@ -205,7 +234,7 @@ mod tests {
     #[test]
     fn test_endpoint_directory_permissions_and_cleanup() {
         use std::os::unix::fs::PermissionsExt as _;
-        let endpoint = Endpoint::new().unwrap();
+        let endpoint = Endpoint::new("hw").unwrap();
         let directory = endpoint.path.parent().unwrap().to_path_buf();
         assert_eq!(
             directory.metadata().unwrap().permissions().mode() & 0o777,
@@ -218,9 +247,11 @@ mod tests {
     /// Connect two native peers using the production endpoint and access checks.
     fn pair() -> (Channel, Channel, Endpoint, local::Server) {
         let (endpoint, server) = Endpoint::fixture();
-        let client = endpoint
-            .connect(std::process::id(), Duration::from_secs(1))
-            .unwrap();
+        let client = Channel::new(
+            endpoint
+                .connect(std::process::id(), Duration::from_secs(1))
+                .unwrap(),
+        );
         let peer = Channel::new(
             server
                 .accept_timeout(Duration::from_secs(1))
@@ -234,7 +265,7 @@ mod tests {
     #[test]
     fn test_hardware_frame_vectors() {
         for (wire, text) in [
-            (b"\x0e{\"version\":1}\0".as_slice(), HELLO),
+            (b"\x0e{\"version\":1}\0".as_slice(), r#"{"version":1}"#),
             (b"\x05\"\xc3\xa9\"\0".as_slice(), "\"é\""),
             (b"\x03ab\x03cd\0".as_slice(), "ab\0cd"),
         ] {
@@ -253,6 +284,8 @@ mod tests {
                 client.read(Duration::from_secs(1)).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
+            peer.send("{}").unwrap();
+            assert_eq!(client.read(Duration::from_secs(1)).unwrap(), "{}");
         }
         for wire in [b"".as_slice(), b"\x0e{\"version\":1}", b"\x03A"] {
             let (mut client, mut peer, _endpoint, _server) = pair();
@@ -278,7 +311,10 @@ mod tests {
             );
             peer.stream().write_all(&wire[split..]).unwrap();
             peer.send("{}").unwrap();
-            assert_eq!(client.read(Duration::from_secs(1)).unwrap(), HELLO);
+            assert_eq!(
+                client.read(Duration::from_secs(1)).unwrap(),
+                r#"{"version":1}"#
+            );
             assert_eq!(client.read(Duration::from_secs(1)).unwrap(), "{}");
         }
     }

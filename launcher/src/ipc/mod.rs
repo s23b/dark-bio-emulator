@@ -11,6 +11,7 @@ pub(crate) mod discovery;
 pub(crate) mod hardware;
 mod http;
 pub(crate) mod local;
+pub(crate) mod qmp;
 pub(crate) mod registry;
 
 #[cfg(test)]

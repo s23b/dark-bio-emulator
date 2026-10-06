@@ -817,7 +817,7 @@ mod tests {
         fn new() -> Self {
             let (endpoint, listener) = HardwareEndpoint::fixture();
             let hardware = Controller::default();
-            hardware.start(endpoint, std::process::id());
+            hardware.start(endpoint, std::process::id(), None);
             let peer = accept(&listener);
             wait_for(|| hardware.snapshot().connected);
             let control =
@@ -855,6 +855,10 @@ mod tests {
                 .unwrap(),
         );
         channel.send(HELLO).unwrap();
+        assert_eq!(
+            channel.read(Duration::from_secs(1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         assert_eq!(channel.read(Duration::from_secs(1)).unwrap(), HELLO);
         channel
     }
@@ -1186,6 +1190,14 @@ mod tests {
         button(&fixture.control.endpoint, true, Some(2), timeout).unwrap();
         assert_eq!(fixture.edge(), "falling");
         fixture.peer.send(HELLO).unwrap();
+        assert_eq!(
+            fixture
+                .peer
+                .read(Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
         assert_eq!(fixture.peer.read(Duration::from_secs(1)).unwrap(), HELLO);
         wait_for(|| fixture.hardware.snapshot().generation != generation);
         let state = fixture.hardware.snapshot();

@@ -16,3 +16,6 @@ mod http;
 #[path = "../src/ipc/local.rs"]
 #[allow(dead_code)] // Standalone transport tests use a subset of the application API.
 mod local;
+
+#[path = "../src/ipc/qmp.rs"]
+mod qmp;
