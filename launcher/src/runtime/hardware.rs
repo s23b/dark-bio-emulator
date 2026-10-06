@@ -27,6 +27,8 @@ use crate::ipc::qmp::Monitor;
 
 /// Pause between failed connections, including while the guest is booting.
 const RETRY: Duration = Duration::from_secs(1);
+/// Pause while QEMU creates its hardware endpoint after accepting the monitor.
+const ENDPOINT_POLL: Duration = Duration::from_millis(50);
 /// Limits button latency when the guest sends no hardware frames.
 const INPUT_POLL: Duration = Duration::from_millis(10);
 /// GPIO for the active-low reset button on the emulated carrier.
@@ -294,7 +296,21 @@ impl Controller {
                     .as_ref()
                     .map(|endpoint| endpoint.connect(pid, RETRY).map(Monitor::new))
                     .transpose()?;
-                let socket = Channel::new(endpoint.connect(pid, RETRY)?);
+
+                // Retain the monitor while QEMU creates the hardware endpoint.
+                // Its Windows pipe cannot accept a replacement connection.
+                let socket = loop {
+                    if self.0.stopping.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    match endpoint.connect(pid, RETRY) {
+                        Ok(stream) => break Channel::new(stream),
+                        Err(err) if err.kind() == ErrorKind::NotFound => {
+                            thread::park_timeout(ENDPOINT_POLL);
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                };
                 self.serve(socket, &buttons, monitor)
             })();
             if let Err(err) = result {
@@ -764,6 +780,102 @@ mod tests {
             .unwrap();
         assert_eq!(read(&mut socket)["payload"]["revision"], 11);
         controller.stop();
+    }
+
+    /// Delayed hardware creation keeps the original monitor connection usable.
+    #[test]
+    fn test_missing_hardware_endpoint_preserves_monitor_connection() {
+        use std::io::{BufRead as _, BufReader, Read as _};
+
+        // Accept the monitor while the hardware endpoint does not exist
+        let (endpoint, listener) = Endpoint::fixture();
+        let name = listener.name().to_owned();
+        drop(listener);
+        let (monitor, monitor_listener) = Endpoint::fixture();
+        let controller = Controller::default();
+        controller.start(endpoint, std::process::id(), Some(monitor));
+        let mut qmp = monitor_listener
+            .accept_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        qmp.set_read_timeout(Duration::from_millis(1200));
+        assert_eq!(qmp.read(&mut [0]).unwrap_err().kind(), ErrorKind::TimedOut);
+        assert!(!controller.snapshot().connected);
+
+        // Negotiate through the original monitor after the hardware pipe appears
+        let listener = Server::bind(&name).unwrap();
+        let worker = thread::spawn(move || {
+            qmp.set_write_timeout(Duration::from_secs(2));
+            qmp.write_all(b"{\"QMP\":{}}\r\n").unwrap();
+            let mut qmp = BufReader::new(qmp);
+            loop {
+                qmp.get_mut().set_read_timeout(Duration::from_secs(3));
+                let mut command = String::new();
+                if qmp.read_line(&mut command).unwrap() == 0 {
+                    break;
+                }
+                let command: Value = serde_json::from_str(&command).unwrap();
+                let response = match command["execute"].as_str().unwrap() {
+                    "qmp_capabilities" => json!({}),
+                    "query-chardev" => json!([{"label":"hw","frontend-open":true}]),
+                    command => panic!("unexpected QMP command: {command}"),
+                };
+                qmp.get_mut().set_write_timeout(Duration::from_secs(2));
+                writeln!(
+                    qmp.get_mut(),
+                    "{}",
+                    json!({"return":response,"id":command["id"]})
+                )
+                .unwrap();
+            }
+        });
+        let mut socket = accept(&listener);
+        socket.synchronize(HELLO).unwrap();
+        assert_eq!(
+            socket.read(Duration::from_secs(1)).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(socket.read(Duration::from_secs(1)).unwrap(), HELLO);
+        socket
+            .send(r#"{"d":"nameplate","id":"self","payload":{"name":"delayed boot"}}"#)
+            .unwrap();
+        wait_for(&controller, |state| {
+            state.connected && state.nameplate.name.as_deref() == Some("delayed boot")
+        });
+
+        // Shutdown releases the retained monitor and its peer worker
+        controller.stop();
+        worker.join().unwrap();
+    }
+
+    /// Shutdown interrupts hardware endpoint discovery and closes its monitor.
+    #[test]
+    fn test_stop_interrupts_missing_hardware_endpoint() {
+        use std::io::Read as _;
+
+        // Leave the hardware endpoint absent after accepting the monitor
+        let (endpoint, listener) = Endpoint::fixture();
+        drop(listener);
+        let (monitor, monitor_listener) = Endpoint::fixture();
+        let controller = Controller::default();
+        controller.start(endpoint, std::process::id(), Some(monitor));
+        let mut qmp = monitor_listener
+            .accept_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+
+        // Stop must wake the connection worker without waiting for a pipe
+        let (done, finished) = mpsc::channel();
+        let stopping = controller.clone();
+        let worker = thread::spawn(move || {
+            stopping.stop();
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_millis(500)).unwrap();
+        worker.join().unwrap();
+        qmp.set_read_timeout(Duration::from_secs(1));
+        assert_eq!(qmp.read(&mut [0]).unwrap(), 0);
+        assert!(controller.snapshot().phase == Phase::Stopped);
     }
 
     /// Port closure clears readiness and timed input without closing the host socket.
