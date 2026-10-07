@@ -175,11 +175,26 @@ mod tests {
             .unwrap();
         assert_eq!(monitor.poll().unwrap(), None);
         assert!(!monitor.open);
+
+        // interprocess flushes and closes Windows pipes on a background thread
         drop(peer);
-        assert!(matches!(
-            monitor.poll().unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor did not observe the peer disconnect"
+            );
+            match monitor.poll() {
+                Ok(None) => {}
+                result => {
+                    assert!(matches!(
+                        result.unwrap_err().kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ));
+                    break;
+                }
+            }
+        }
     }
 
     /// Missing state and oversized monitor messages fail instead of asserting readiness.
