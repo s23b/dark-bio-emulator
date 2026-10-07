@@ -334,16 +334,15 @@ mod tests {
     /// Directories are private before binding, and an unrestricted DACL is refused.
     #[test]
     fn test_directory_access_controls() {
-        use windows_sys::Win32::{
-            Security::{Authorization::SetSecurityInfo, PROTECTED_DACL_SECURITY_INFORMATION},
-            Storage::FileSystem::WRITE_DAC,
+        use windows_sys::Win32::Security::{
+            Authorization::SetSecurityInfo, PROTECTED_DACL_SECURITY_INFORMATION,
         };
         let directory = super::super::private_directory().unwrap();
         verify_directory(directory.path()).unwrap();
 
         // An existing directory must never be silently accepted with a permissive ACL
         let file = OpenOptions::new()
-            .access_mode(WRITE_DAC)
+            .access_mode(FILE_ALL_ACCESS)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(directory.path())
             .unwrap();

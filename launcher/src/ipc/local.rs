@@ -454,7 +454,8 @@ impl Server {
 pub(crate) fn track_socket(path: PathBuf, remove_directory: bool) -> io::Result<()> {
     let mut sockets = SOCKETS.lock().unwrap();
     if sockets.is_none() {
-        // process::exit skips destructors, including those in registry worker threads
+        // Unix also runs this backstop when main returns without explicit cleanup
+        #[cfg(unix)]
         // SAFETY: cleanup_sockets has the required ABI and remains valid until process exit
         if unsafe { libc::atexit(cleanup_sockets) } != 0 {
             return Err(io::Error::other("could not register local IPC cleanup"));
@@ -470,6 +471,13 @@ pub(crate) fn track_socket(path: PathBuf, remove_directory: bool) -> io::Result<
     Ok(())
 }
 
+/// Remove owned endpoints best-effort before exiting without Rust destructors.
+pub(crate) fn exit(code: i32) -> ! {
+    // Windows ExitProcess bypasses C atexit callbacks
+    cleanup_sockets();
+    std::process::exit(code);
+}
+
 /// Remove an owned socket and release its process-exit cleanup record.
 pub(crate) fn remove_socket(path: &std::path::Path) {
     let mut sockets = SOCKETS.lock().unwrap();
@@ -483,7 +491,7 @@ pub(crate) fn remove_socket(path: &std::path::Path) {
 }
 
 /// Remove owned endpoints without waiting for another thread during process exit.
-extern "C" fn cleanup_sockets() {
+pub(crate) extern "C" fn cleanup_sockets() {
     if let Ok(mut sockets) = SOCKETS.try_lock()
         && let Some(sockets) = sockets.as_mut()
     {
@@ -751,7 +759,7 @@ mod tests {
             let _test = Server::bind(&format!("t-{id}")).unwrap();
             let _registry = Server::bind(&format!("registry-{}", &id[..32])).unwrap();
             let _fixture = Server::bind_test(&format!("registry-fixture-{}", &id[..32])).unwrap();
-            std::process::exit(0);
+            exit(0);
         }
         let id = identity();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -782,7 +790,7 @@ mod tests {
         if let Ok(name) = std::env::var("ARK_IPC_BUSY_EXIT_TEST") {
             let _server = Server::bind(&name).unwrap();
             let _sockets = SOCKETS.lock().unwrap();
-            std::process::exit(0);
+            exit(0);
         }
         let name = format!("t-{}", identity());
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())

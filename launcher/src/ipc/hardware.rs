@@ -256,14 +256,12 @@ mod tests {
             .arg("-chardev")
             .arg(hardware.chardev());
         if let Some(libs) = std::env::var_os("ARK_EMULATOR_TEST_QEMU_LIBS") {
-            let path = std::env::var_os("PATH").unwrap_or_default();
+            let libs = PathBuf::from(libs);
             command.env(
-                "PATH",
-                std::env::join_paths(
-                    std::iter::once(PathBuf::from(&libs)).chain(std::env::split_paths(&path)),
-                )
-                .unwrap(),
+                crate::platform::library_path_var(),
+                crate::platform::prepend_library_path(&libs),
             );
+            command.env("QEMU_MODULE_DIR", &libs);
             command.arg("-L").arg(libs);
         }
         let mut guest = Guest(command.spawn().unwrap());

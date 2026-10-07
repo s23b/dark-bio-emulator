@@ -116,7 +116,7 @@ pub(crate) fn show_from_thread(app: &AppHandle, title: &str, err: anyhow::Error)
     {
         // The event loop is gone, so no window is possible and nothing will
         // exit the process for us.
-        std::process::exit(1);
+        crate::ipc::local::exit(1);
     }
 }
 
@@ -141,7 +141,7 @@ fn prepare(title: &str, err: anyhow::Error) -> Option<String> {
         // Not app.exit: there is no UI state worth unwinding here, and the
         // caller may still be inside `setup` with no event loop yet to carry
         // the request. QEMU dies with us either way, via `orphan`.
-        std::process::exit(1);
+        crate::ipc::local::exit(1);
     }
     Some(report)
 }
@@ -158,7 +158,7 @@ fn code(title: &str) -> Code {
 fn open_or_exit(app: &AppHandle, report: &str) {
     if let Err(e) = open(app, report) {
         eprintln!("could not open the error window: {e}");
-        std::process::exit(1);
+        crate::ipc::local::exit(1);
     }
 }
 

@@ -19,3 +19,6 @@ mod local;
 
 #[path = "../src/ipc/qmp.rs"]
 mod qmp;
+
+#[path = "../src/platform/libraries.rs"]
+mod platform;

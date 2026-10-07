@@ -32,13 +32,15 @@
 //!   - **Native console**: a Windows console carries the full palette without
 //!     anything in the environment saying so.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::diagnostics::{self, log};
 
 pub(crate) mod orphan;
+
+mod libraries;
+pub(crate) use libraries::{library_path_var, prepend_library_path};
 
 /// Recognize a terminal interrupt also delivered directly to QEMU.
 #[cfg(unix)]
@@ -110,28 +112,6 @@ pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
         Some(rest) => PathBuf::from(rest),
         None => path.to_path_buf(),
     }
-}
-
-/// Name of the platform's dynamic-linker library search-path variable.
-pub(crate) fn library_path_var() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else if cfg!(target_os = "windows") {
-        "PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    }
-}
-
-/// `dir` prepended onto the current value of [`library_path_var`], pointing a
-/// spawned QEMU at its bundled libraries without patching the binaries. The
-/// loader consults this search path before a dependency's recorded path, even
-/// an absolute one, which is why the fetch scripts leave rpaths alone.
-pub(crate) fn prepend_library_path(dir: &Path) -> OsString {
-    let existing = std::env::var_os(library_path_var());
-    let existing = existing.iter().flat_map(std::env::split_paths);
-    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(existing))
-        .unwrap_or_else(|_| dir.as_os_str().to_owned())
 }
 
 /// Stops Windows allocating a console window for a console-subsystem child,

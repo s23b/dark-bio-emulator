@@ -68,18 +68,18 @@ fn main() {
             platform::attach_console();
             if error.exit_code() == 0 {
                 let _ = error.print();
-                std::process::exit(0);
+                ipc::local::exit(0);
             }
             let mut global = Cli::parse_from(["ark-emulator"]).global;
             global.json = json;
             output::Output::new(&global).error(&usage(&error));
-            std::process::exit(2);
+            ipc::local::exit(2);
         }
     };
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| {
         platform::attach_console();
         let _ = error.print();
-        std::process::exit(2);
+        ipc::local::exit(2);
     });
     if cli.version || cli.command.is_some() || cli.boot.headless {
         platform::attach_console();
@@ -92,10 +92,10 @@ fn main() {
     let context = tauri::generate_context!();
     if let Err(err) = cli.validate() {
         output.error(&err);
-        std::process::exit(err.exit());
+        ipc::local::exit(err.exit());
     }
     if cli.version || cli.command.is_some() {
-        std::process::exit(commands::run(
+        ipc::local::exit(commands::run(
             cli.command,
             &cli.global,
             &output,

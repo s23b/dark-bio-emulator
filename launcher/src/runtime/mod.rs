@@ -53,7 +53,7 @@ pub(crate) fn shut_down(code: i32) -> ! {
         }
     }
     discovery::deregister();
-    std::process::exit(code);
+    crate::ipc::local::exit(code);
 }
 
 /// Resources held until the user or an unattended launch starts the guest.
