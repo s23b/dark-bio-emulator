@@ -28,6 +28,7 @@ toml = "1"
 rfd = "0.17"
 tiny_http = { version = "0.12", default-features = false }
 socket2 = "0.6.5"
+polling = "3.11"
 libc = "0.2"
 httparse = "1.10"
 sha2 = "0.10"

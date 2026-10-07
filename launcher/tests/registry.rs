@@ -26,10 +26,29 @@ mod local;
 #[allow(dead_code)] // Scripted peers use the production framing without the client helper.
 mod http;
 
+/// Run a lifecycle fixture with one app-data namespace for all its processes.
+fn isolated(name: &str) -> bool {
+    if std::env::var_os("ARK_REGISTRY_TEST").is_some() {
+        return false;
+    }
+    let directory = tempfile::TempDir::new().unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name])
+        .env("ARK_REGISTRY_TEST", "1")
+        .env("XDG_DATA_HOME", directory.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "{name}");
+    true
+}
+
 /// Refused initial and later publications stop the guest and reach either caller.
 #[test]
 fn test_registration_refusals_reach_standalone_and_start_commands() {
     let _exclusive = local::PROCESS_TEST.lock().unwrap();
+    if isolated("test_registration_refusals_reach_standalone_and_start_commands") {
+        return;
+    }
     // Never send test publications into an emulator's live registry
     let listener = match TcpListener::bind(("127.0.0.1", 18180)) {
         Ok(listener) => listener,
@@ -111,7 +130,6 @@ fn test_registration_refusals_reach_standalone_and_start_commands() {
             .arg(directory.path().join("kernel"))
             .arg("--initrd")
             .arg(directory.path().join("initrd"))
-            .env("XDG_DATA_HOME", directory.path().join("data"))
             .env("CI", "1")
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY");
@@ -148,6 +166,9 @@ fn test_registration_refusals_reach_standalone_and_start_commands() {
 #[test]
 fn test_direct_stop_all_survives_registry_loss_after_selection() {
     let _exclusive = local::PROCESS_TEST.lock().unwrap();
+    if isolated("test_direct_stop_all_survives_registry_loss_after_selection") {
+        return;
+    }
     let listener = match TcpListener::bind(("127.0.0.1", 18180)) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
@@ -236,7 +257,6 @@ fn test_direct_stop_all_survives_registry_loss_after_selection() {
             .arg(root.join("kernel"))
             .arg("--initrd")
             .arg(root.join("initrd"))
-            .env("XDG_DATA_HOME", root.join("data"))
             .env("CI", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -260,8 +280,7 @@ fn test_direct_stop_all_survives_registry_loss_after_selection() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ark-emulator"));
     command
         .args(["stop", "--all", "--json", "--timeout", "5"])
-        .env("CI", "1")
-        .env("XDG_DATA_HOME", directory.path().join("cli"));
+        .env("CI", "1");
     let output = bounded(&mut command, &directory.path().join("unused.pid"));
     assert!(
         output.status.success(),
@@ -312,6 +331,9 @@ fn test_direct_stop_all_survives_registry_loss_after_selection() {
 #[test]
 fn test_direct_stop_all_preserves_partial_output_on_refusal() {
     let _exclusive = local::PROCESS_TEST.lock().unwrap();
+    if isolated("test_direct_stop_all_preserves_partial_output_on_refusal") {
+        return;
+    }
     let listener = match TcpListener::bind(("127.0.0.1", 18180)) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
@@ -374,8 +396,7 @@ fn test_direct_stop_all_preserves_partial_output_on_refusal() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ark-emulator"));
     command
         .args(["stop", "--all", "--json", "--timeout", "5"])
-        .env("CI", "1")
-        .env("XDG_DATA_HOME", directory.path());
+        .env("CI", "1");
     let output = bounded(&mut command, &directory.path().join("unused.pid"));
     assert_eq!(output.status.code(), Some(3));
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

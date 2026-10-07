@@ -27,16 +27,22 @@ Transfer-Encoding headers are rejected.
 The registry endpoint is named `registry-18180`. Each launch's control
 endpoint is named `c-ID`, where ID is its advertised launch id.
 
-Every host uses filesystem Unix-domain sockets. On Unix, socket names live
-under `/tmp/ark-emulator-UID/`, where UID is the effective user id. The
-directory has mode 0700 and sockets have mode 0600.
+Every host uses filesystem Unix-domain sockets under
+`bio.dark.emulator/ipc` in the current user's local application data directory:
 
-Windows uses native AF_UNIX sockets under the current user's local application
-data directory, in `ArkIPC`. Each filename is the first 32 lowercase hex
-characters of SHA-256 over the UTF-8 endpoint name. The directory is created
-with a user-only DACL that its sockets inherit. Clients verify directory
-ownership and access controls before connecting. Socket paths must fit within
-the host's AF_UNIX path limit. Processes running as the same user may connect.
+    macOS    ~/Library/Application Support/bio.dark.emulator/ipc
+    Linux    ~/.local/share/bio.dark.emulator/ipc
+    Windows  %LOCALAPPDATA%\bio.dark.emulator\ipc
+
+Linux honors XDG_DATA_HOME when set. Each filename is the first 32 lowercase
+hex characters of SHA-256 over the UTF-8 endpoint name. QEMU hardware and
+monitor sockets occupy separate private subdirectories of the same IPC root.
+Socket paths must fit within the host's AF_UNIX path limit.
+
+Unix directories have mode 0700 and sockets have mode 0600. Windows directories
+are created with a user-only DACL inherited by their sockets. Clients verify
+directory ownership and access controls before connecting. Processes running
+as the same user may connect.
 
 Persistent registry lock files protect live listeners during stale socket
 recovery. Unique control endpoints need no lock file. Sockets are removed on

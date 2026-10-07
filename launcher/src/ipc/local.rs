@@ -14,16 +14,14 @@
 use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::unix::{io::AsRawFd as _, net::UnixStream};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
-#[cfg(windows)]
-use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use polling::{Event, Events, Poller};
 use sha2::{Digest as _, Sha256};
 use socket2::{Domain, SockAddr, Socket, Type};
 use tiny_http::{Header, Method, Response};
@@ -32,13 +30,12 @@ use tiny_http::{Header, Method, Response};
 #[path = "local_windows.rs"]
 mod windows;
 #[cfg(windows)]
-use windows::{prepare, verify_directory};
+use windows::{create_directory, prepare, verify_directory};
 
-/// Poll interval for nonblocking I/O under a shared deadline.
-const POLL: Duration = Duration::from_millis(5);
-/// Idle interval between nonblocking Windows accepts.
-#[cfg(windows)]
-const ACCEPT_POLL: Duration = Duration::from_millis(100);
+/// Registration key for the sole socket owned by each readiness poller.
+const SOCKET_EVENT: usize = 0;
+/// Maximum attempts to allocate a fresh private channel directory.
+const DIRECTORY_ATTEMPTS: usize = 16;
 /// Delay after a listener fails to accept a connection.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum time to receive a request or deliver a response.
@@ -95,7 +92,19 @@ pub(crate) fn identity() -> String {
     )
 }
 
-/// Resolve a protocol name within the current user's local IPC namespace.
+/// Resolve the shared IPC root within this user's local application data.
+fn directory() -> io::Result<PathBuf> {
+    dirs::data_local_dir()
+        .map(|path| path.join("bio.dark.emulator").join("ipc"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "local application data directory is unavailable",
+            )
+        })
+}
+
+/// Resolve a protocol name to the same short filename on every host.
 pub(crate) fn address(name: &str) -> io::Result<PathBuf> {
     if name.is_empty()
         || name.len() > 70
@@ -108,16 +117,21 @@ pub(crate) fn address(name: &str) -> io::Result<PathBuf> {
             "invalid local endpoint name",
         ));
     }
-    #[cfg(unix)]
-    {
-        // SAFETY: geteuid has no preconditions and does not retain pointers
-        let uid = unsafe { libc::geteuid() };
-        Ok(PathBuf::from(format!("/tmp/ark-emulator-{uid}")).join(name))
+    let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+    let path = directory()?.join(&digest[..32]);
+    SockAddr::unix(&path)?;
+    Ok(path)
+}
+
+/// Create the private IPC root or verify its existing ownership and permissions.
+fn ensure_directory(path: &std::path::Path) -> io::Result<()> {
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    match create_directory(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
     }
-    #[cfg(windows)]
-    {
-        windows::address(name)
-    }
+    verify_directory(path)
 }
 
 /// Private directory retained until QEMU's endpoint has been removed.
@@ -141,31 +155,66 @@ impl Drop for PrivateDirectory {
 
 /// Create a private directory before QEMU can bind a socket inside it.
 pub(crate) fn private_directory() -> io::Result<PrivateDirectory> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let directory = tempfile::Builder::new()
-            .prefix("ark-hw-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in("/tmp")?;
-        Ok(PrivateDirectory {
-            path: directory.keep(),
-        })
+    let root = directory()?;
+    ensure_directory(&root)?;
+
+    // A collision never adopts or removes a directory belonging to another endpoint
+    for _ in 0..DIRECTORY_ATTEMPTS {
+        let path = root.join(format!("h-{}", &identity()[..16]));
+        match create_directory(&path) {
+            Ok(()) => {
+                let directory = PrivateDirectory { path };
+                verify_directory(directory.path())?;
+                return Ok(directory);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
     }
-    #[cfg(windows)]
-    {
-        let root = windows::directory()?;
-        windows::create_directory(&root)?;
-        let directory = root.join(format!("h-{}", &identity()[..16]));
-        windows::create_directory(&directory)?;
-        Ok(PrivateDirectory { path: directory })
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a private IPC directory",
+    ))
+}
+
+/// Nonblocking socket registered for readiness and explicit wakeups on every host.
+struct ReadySocket {
+    /// Poller released before its socket, after unregistering it in `Drop`.
+    poller: Poller,
+    /// Socket kept alive for its entire readiness registration.
+    socket: Socket,
+}
+
+impl ReadySocket {
+    /// Register an owned socket without requesting events until a wait begins.
+    fn new(socket: Socket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        let poller = Poller::new()?;
+        // SAFETY: this wrapper owns the socket and unregisters it before closing it
+        unsafe { poller.add(&socket, Event::none(SOCKET_EVENT))? };
+        Ok(Self { poller, socket })
+    }
+
+    /// Wait for readiness, a shutdown notification or the fixed deadline.
+    fn wait(&self, interest: Event, deadline: Instant) -> io::Result<()> {
+        // One-shot interest is rearmed after every WouldBlock, including timed-out waits
+        self.poller.modify(&self.socket, interest)?;
+        let mut events = Events::with_capacity(NonZeroUsize::new(1).unwrap());
+        self.poller.wait_deadline(&mut events, deadline)?;
+        Ok(())
+    }
+}
+
+impl Drop for ReadySocket {
+    fn drop(&mut self) {
+        let _ = self.poller.delete(&self.socket);
     }
 }
 
 /// A local connection with a single deadline for each read or write phase.
 pub(crate) struct Stream {
-    /// Nonblocking socket used for every host platform.
-    socket: Socket,
+    /// Nonblocking connection and its platform-independent readiness wait.
+    io: ReadySocket,
     /// Deadline shared by partial reads in the current phase.
     read_deadline: Cell<Instant>,
     /// Deadline shared by partial writes in the current phase.
@@ -184,18 +233,18 @@ impl Stream {
         verify_directory(path.parent().unwrap())?;
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         socket.connect_timeout(&SockAddr::unix(path)?, timeout)?;
-        socket.set_nonblocking(true)?;
-        Ok(Self::new(socket, timeout))
+        Self::new(socket, timeout)
     }
 
-    /// Wrap an accepted nonblocking connection with bounded I/O.
-    fn new(socket: Socket, timeout: Duration) -> Self {
+    /// Wrap a connection with readiness waits and bounded I/O.
+    fn new(socket: Socket, timeout: Duration) -> io::Result<Self> {
+        let io = ReadySocket::new(socket)?;
         let deadline = Instant::now() + timeout;
-        Self {
-            socket,
+        Ok(Self {
+            io,
             read_deadline: Cell::new(deadline),
             write_deadline: Cell::new(deadline),
-        }
+        })
     }
 
     /// Set the budget for the next response read phase.
@@ -207,55 +256,69 @@ impl Stream {
     pub(crate) fn set_write_timeout(&self, timeout: Duration) {
         self.write_deadline.set(Instant::now() + timeout);
     }
-}
 
-/// Retry readiness under a fixed deadline, never replaying an application request.
-fn bounded<T>(deadline: Instant, mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local IPC deadline expired"))?;
-        match operation() {
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(POLL.min(remaining))
+    /// Retry readiness under a fixed deadline, never replaying an application request.
+    fn bounded<T>(
+        &self,
+        deadline: Instant,
+        interest: Event,
+        mut operation: impl FnMut(&Socket) -> io::Result<T>,
+    ) -> io::Result<T> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "local IPC deadline expired",
+                ));
             }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-            result => return result,
+            match operation(&self.io.socket) {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(err) = self.io.wait(interest, deadline)
+                        && err.kind() != io::ErrorKind::Interrupted
+                    {
+                        return Err(err);
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
         }
     }
 }
 
 impl Read for Stream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        bounded(self.read_deadline.get(), || self.socket.read(bytes))
+        self.bounded(
+            self.read_deadline.get(),
+            Event::readable(SOCKET_EVENT),
+            |mut socket| socket.read(bytes),
+        )
     }
 }
 
 impl Write for Stream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        bounded(self.write_deadline.get(), || self.socket.write(bytes))
+        self.bounded(
+            self.write_deadline.get(),
+            Event::writable(SOCKET_EVENT),
+            |mut socket| socket.write(bytes),
+        )
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.socket.flush()
+        (&self.io.socket).flush()
     }
 }
 
 /// One user-owned listener with exclusive name ownership and bounded accepts.
 pub(crate) struct Server {
-    /// Platform listener, inaccessible to browser networking APIs.
-    listener: Socket,
+    /// Listener and readiness notifications, inaccessible to browser networking APIs.
+    listener: ReadySocket,
     /// Endpoint name, never an arbitrary path supplied by discovery.
     #[cfg(test)]
     name: String,
     /// Interrupts an accept loop during launcher shutdown.
     stopped: AtomicBool,
-    /// Socket pair that interrupts the listener's readiness wait.
-    #[cfg(unix)]
-    wake: (UnixStream, UnixStream),
-    /// Notification that interrupts the idle socket wait.
-    #[cfg(windows)]
-    wake: (Mutex<()>, Condvar),
     /// Removes the endpoint after the listener closes and before releasing its lock.
     _binding: Binding,
 }
@@ -278,30 +341,26 @@ impl Server {
     /// Bind a private endpoint, recovering a stale socket only under its lock.
     pub(crate) fn bind(name: &str) -> io::Result<Self> {
         let path = address(name)?;
-        let lock = prepare(&path, name)?;
-        #[cfg(unix)]
-        let wake = {
-            let pair = UnixStream::pair()?;
-            pair.1.set_nonblocking(true)?;
-            pair
+        ensure_directory(path.parent().unwrap())?;
+        let lock = if name.starts_with("c-") || name.starts_with("t-") {
+            None
+        } else {
+            Some(prepare(&path)?)
         };
-        #[cfg(windows)]
-        let wake = (Mutex::new(()), Condvar::new());
         let listener = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        listener.set_nonblocking(true)?;
         listener.bind(&SockAddr::unix(&path)?)?;
         let binding = Binding {
             path: path.clone(),
             _lock: lock,
         };
         listener.listen(128)?;
+        let listener = ReadySocket::new(listener)?;
         track_socket(path.clone(), false)?;
         let server = Self {
             listener,
             #[cfg(test)]
             name: name.to_owned(),
             stopped: AtomicBool::new(false),
-            wake,
             _binding: binding,
         };
 
@@ -373,13 +432,12 @@ impl Server {
             if self.stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Ok(None);
             }
-            match self.listener.accept() {
+            match self.listener.socket.accept() {
                 Ok((socket, _)) => {
-                    socket.set_nonblocking(true)?;
-                    return Ok(Some(Stream::new(socket, IO_TIMEOUT)));
+                    return Stream::new(socket, IO_TIMEOUT).map(Some);
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    if let Err(err) = self.wait(deadline)
+                    if let Err(err) = self.listener.wait(Event::readable(SOCKET_EVENT), deadline)
                         && err.kind() != io::ErrorKind::Interrupted
                     {
                         thread::sleep(ACCEPT_BACKOFF);
@@ -395,58 +453,10 @@ impl Server {
         }
     }
 
-    /// Block until a connection, shutdown notification or idle deadline arrives.
-    #[cfg(unix)]
-    fn wait(&self, deadline: Instant) -> io::Result<()> {
-        let mut fds = [
-            libc::pollfd {
-                fd: self.listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: self.wake.0.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let timeout = deadline.saturating_duration_since(Instant::now());
-        let millis = timeout.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
-        // SAFETY: fds contains two initialized entries whose descriptors remain alive
-        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if fds.iter().any(|fd| fd.revents & libc::POLLNVAL != 0) {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
-        }
-        Ok(())
-    }
-
-    /// Wait for the next socket poll or a shutdown notification.
-    #[cfg(windows)]
-    fn wait(&self, deadline: Instant) -> io::Result<()> {
-        let timeout = deadline.saturating_duration_since(Instant::now());
-        let _guard = self
-            .wake
-            .1
-            .wait_timeout_while(
-                self.wake.0.lock().unwrap(),
-                ACCEPT_POLL.min(timeout),
-                |_| !self.stopped.load(Ordering::Acquire),
-            )
-            .unwrap();
-        Ok(())
-    }
-
     /// Wake an idle receiver during shutdown.
     pub(crate) fn unblock(&self) {
-        #[cfg(windows)]
-        let _guard = self.wake.0.lock().unwrap();
         self.stopped.store(true, Ordering::Release);
-        #[cfg(unix)]
-        let _ = (&self.wake.1).write(&[1]);
-        #[cfg(windows)]
-        self.wake.1.notify_all();
+        let _ = self.listener.poller.notify();
     }
 }
 
@@ -501,23 +511,18 @@ pub(crate) extern "C" fn cleanup_sockets() {
     }
 }
 
-/// Create a private directory and lock a name before reclaiming its socket.
+/// Create a new user-only directory without accepting an existing path.
 #[cfg(unix)]
-fn prepare(path: &std::path::Path, name: &str) -> io::Result<Option<File>> {
-    use std::fs::{DirBuilder, OpenOptions};
-    use std::os::unix::fs::{
-        DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _,
-    };
-    let directory = path.parent().unwrap();
-    match DirBuilder::new().mode(0o700).create(directory) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(err) => return Err(err),
-    }
-    verify_directory(directory)?;
-    if name.starts_with("c-") || name.starts_with("t-") {
-        return Ok(None);
-    }
+fn create_directory(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Lock a persistent endpoint before reclaiming an owned stale socket.
+#[cfg(unix)]
+fn prepare(path: &std::path::Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
     // SAFETY: geteuid has no preconditions and does not retain pointers
     let uid = unsafe { libc::geteuid() };
     let lock = OpenOptions::new()
@@ -552,7 +557,7 @@ fn prepare(path: &std::path::Path, name: &str) -> io::Result<Option<File>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    Ok(Some(lock))
+    Ok(lock)
 }
 
 /// Reject redirected or accessible IPC directories on both sides of a connection.
@@ -696,6 +701,82 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Protocol names map to the app-data paths native clients expect on every host.
+    #[test]
+    fn test_endpoint_paths_match_the_shared_namespace() {
+        let root = dirs::data_local_dir()
+            .unwrap()
+            .join("bio.dark.emulator")
+            .join("ipc");
+        for (name, file) in [
+            ("registry-18180", "675ee216b25e35275ab9abd52629e31f"),
+            ("c-0123456789abcdef", "498ca4e5b7df41bc7d678993c7bb742e"),
+        ] {
+            assert_eq!(address(name).unwrap(), root.join(file), "{name}");
+        }
+    }
+
+    /// Private channel directories share the IPC root and retain exclusive ownership.
+    #[test]
+    fn test_private_directories_are_distinct_and_removed_on_drop() {
+        let first = private_directory().unwrap();
+        let second = private_directory().unwrap();
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        assert_eq!(first_path.parent().unwrap(), directory().unwrap());
+        assert_eq!(first_path.parent(), second_path.parent());
+        assert_ne!(first_path, second_path);
+        verify_directory(&first_path).unwrap();
+        verify_directory(&second_path).unwrap();
+
+        // Exclusive creation preserves an existing directory and its contents
+        let retained = second_path.join("retained");
+        std::fs::write(&retained, b"owned by the other channel").unwrap();
+        assert_eq!(
+            create_directory(&second_path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        drop(first);
+        assert!(!first_path.exists());
+        assert_eq!(
+            std::fs::read(&retained).unwrap(),
+            b"owned by the other channel"
+        );
+        std::fs::remove_file(retained).unwrap();
+        drop(second);
+        assert!(!second_path.exists());
+    }
+
+    /// Existing broad permissions and redirected IPC directories are refused unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn test_directory_access_controls() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let directory = private_directory().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            ensure_directory(directory.path()).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            Stream::connect_path(&directory.path().join("hw.sock"), IO_TIMEOUT)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        // Following a private target through a link must not bypass directory checks
+        let target = private_directory().unwrap();
+        let link = directory.path().join("link");
+        symlink(target.path(), &link).unwrap();
+        assert_eq!(
+            ensure_directory(&link).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(link).unwrap();
+    }
 
     /// Private listeners preserve replies and refuse a second live owner.
     #[test]
@@ -984,22 +1065,28 @@ mod tests {
         let err = client.read(&mut [0]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
 
-        // Closing after the final fragment supplies real EOF
-        reply.write_all(b"last").unwrap();
-        drop(reply);
+        // Fragments and EOF arriving during a readiness wait must each wake the reader
+        let writer = thread::spawn(move || {
+            for fragment in [b"last".as_slice(), b" reply"] {
+                thread::sleep(Duration::from_millis(20));
+                reply.write_all(fragment).unwrap();
+            }
+            thread::sleep(Duration::from_millis(20));
+        });
         client.set_read_timeout(IO_TIMEOUT);
         let mut last = String::new();
         client.read_to_string(&mut last).unwrap();
-        assert_eq!(last, "last");
+        writer.join().unwrap();
+        assert_eq!(last, "last reply");
     }
 
-    /// A peer that stops consuming bytes cannot leave a writer blocked indefinitely.
+    /// A stalled peer bounds writes, which resume when it starts consuming bytes.
     #[test]
-    fn test_full_send_buffer_obeys_the_write_deadline() {
+    fn test_full_send_buffer_times_out_and_resumes() {
         let name = format!("t-{}", identity());
         let server = Server::bind(&name).unwrap();
         let mut client = Stream::connect(&name, IO_TIMEOUT).unwrap();
-        let _peer = server.listener.accept().unwrap();
+        let mut peer = server.accept_timeout(IO_TIMEOUT).unwrap().unwrap();
         client.set_write_timeout(Duration::from_millis(40));
 
         // Bound the attempted data while filling the OS buffer without a reader
@@ -1012,6 +1099,22 @@ mod tests {
         }
         let err = failure.expect("the send buffer accepted 16 MiB without a reader");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+
+        // Reusing the connection rearms writable interest after the expired deadline
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            peer.set_read_timeout(IO_TIMEOUT);
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).unwrap();
+            received
+        });
+        client.set_write_timeout(IO_TIMEOUT);
+        client.write_all(b"resumed").unwrap();
+        drop(client);
+        let received = reader.join().unwrap();
+        let buffered = received.strip_suffix(b"resumed").unwrap();
+        assert!(!buffered.is_empty());
+        assert!(buffered.iter().all(|byte| *byte == 0));
     }
 
     /// Listeners queue more than one client before accepting either connection.
@@ -1023,5 +1126,41 @@ mod tests {
         let _second = Stream::connect(&name, IO_TIMEOUT).unwrap();
         assert!(server.accept_timeout(IO_TIMEOUT).unwrap().is_some());
         assert!(server.accept_timeout(IO_TIMEOUT).unwrap().is_some());
+    }
+
+    /// Accept readiness wakes again after an idle timeout and successive connections.
+    #[test]
+    fn test_accept_readiness_rearms_after_timeouts_and_connections() {
+        let name = format!("t-{}", identity());
+        let server = Server::bind(&name).unwrap();
+        assert!(
+            server
+                .accept_timeout(Duration::from_millis(20))
+                .unwrap()
+                .is_none()
+        );
+
+        // Each client arrives after the previous connection has been handled
+        let (waiting, ready) = std::sync::mpsc::channel();
+        let receiver = thread::spawn(move || {
+            for expected in [1, 2, 3] {
+                waiting.send(()).unwrap();
+                let mut stream = server.accept_timeout(IO_TIMEOUT).unwrap().unwrap();
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                assert_eq!(byte, [expected]);
+                stream.write_all(&byte).unwrap();
+            }
+        });
+        for value in [1, 2, 3] {
+            ready.recv_timeout(IO_TIMEOUT).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            let mut client = Stream::connect(&name, IO_TIMEOUT).unwrap();
+            client.write_all(&[value]).unwrap();
+            let mut echoed = [0];
+            client.read_exact(&mut echoed).unwrap();
+            assert_eq!(echoed, [value]);
+        }
+        receiver.join().unwrap();
     }
 }

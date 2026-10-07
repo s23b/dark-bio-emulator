@@ -11,10 +11,9 @@ use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 
-use sha2::{Digest as _, Sha256};
 use windows_sys::Win32::{
     Foundation::LocalFree,
     Security::{
@@ -79,27 +78,7 @@ impl Descriptor {
     }
 }
 
-/// Resolve the same per-user root for the launcher and native clients.
-pub(super) fn directory() -> io::Result<PathBuf> {
-    dirs::data_local_dir()
-        .map(|path| path.join("ArkIPC"))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "local application data directory is unavailable",
-            )
-        })
-}
-
-/// Hash the protocol name so Windows socket paths stay within AF_UNIX's limit.
-pub(super) fn address(name: &str) -> io::Result<PathBuf> {
-    let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
-    let path = directory()?.join(&digest[..32]);
-    socket2::SockAddr::unix(&path)?;
-    Ok(path)
-}
-
-/// Create a directory with its user-only DACL already in place.
+/// Create a new directory with its user-only DACL, rejecting existing paths.
 pub(super) fn create_directory(path: &Path) -> io::Result<()> {
     let descriptor = Descriptor::private()?;
     let attributes = SECURITY_ATTRIBUTES {
@@ -110,12 +89,9 @@ pub(super) fn create_directory(path: &Path) -> io::Result<()> {
     let path_wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: the terminated path and descriptor remain live for the call
     if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } == 0 {
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::AlreadyExists {
-            return Err(err);
-        }
+        return Err(io::Error::last_os_error());
     }
-    verify_directory(path)
+    Ok(())
 }
 
 /// Reject reparse points, foreign owners and directory access granted to other users.
@@ -208,11 +184,7 @@ pub(super) fn verify_directory(path: &Path) -> io::Result<()> {
 }
 
 /// Hold a persistent ownership lock before deleting a stale registry socket.
-pub(super) fn prepare(path: &Path, name: &str) -> io::Result<Option<File>> {
-    create_directory(path.parent().unwrap())?;
-    if name.starts_with("c-") || name.starts_with("t-") {
-        return Ok(None);
-    }
+pub(super) fn prepare(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -267,7 +239,7 @@ pub(super) fn prepare(path: &Path, name: &str) -> io::Result<Option<File>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    Ok(Some(lock))
+    Ok(lock)
 }
 
 /// Read the process user's SID for directory ownership and access checks.
@@ -364,7 +336,9 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(
-            create_directory(directory.path()).unwrap_err().kind(),
+            super::super::ensure_directory(directory.path())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::PermissionDenied
         );
         assert!(
