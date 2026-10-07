@@ -47,77 +47,44 @@ impl std::error::Error for FrameTooLarge {}
 pub(crate) struct Endpoint {
     /// QEMU character backend identifier.
     id: &'static str,
-    /// Filesystem socket or fully qualified Windows pipe name.
+    /// Filesystem Unix-domain socket path.
     path: PathBuf,
     /// Private directory prevents access before QEMU creates its socket.
-    #[cfg(unix)]
-    _directory: tempfile::TempDir,
+    _directory: local::PrivateDirectory,
 }
 
 impl Endpoint {
     /// Reserve an isolated channel name before spawning QEMU.
     pub(crate) fn new(id: &'static str) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let directory = tempfile::Builder::new()
-                .prefix("ark-hw-")
-                .permissions(std::fs::Permissions::from_mode(0o700))
-                .tempdir_in("/tmp")?;
-            local::track_socket(directory.path().join("hw.sock"), true)?;
-            Ok(Self {
-                id,
-                path: directory.path().join("hw.sock"),
-                _directory: directory,
-            })
-        }
-        #[cfg(windows)]
-        {
-            Ok(Self {
-                id,
-                path: PathBuf::from(format!(r"\\.\pipe\ark-hw-{}", local::identity())),
-            })
-        }
+        let directory = local::private_directory()?;
+        let path = directory.path().join("hw.sock");
+        socket2::SockAddr::unix(&path)?;
+        local::track_socket(path.clone(), true)?;
+        Ok(Self {
+            id,
+            path,
+            _directory: directory,
+        })
     }
 
     /// Describe the QEMU backend while leaving the guest console on its own device.
     pub(crate) fn chardev(&self) -> String {
-        #[cfg(unix)]
-        {
-            format!(
-                "socket,id={},path={},server=on,wait=off",
-                self.id,
-                self.path.display()
-            )
-        }
-        #[cfg(windows)]
-        {
-            format!(
-                "pipe,id={},path={}",
-                self.id,
-                self.path
-                    .to_str()
-                    .unwrap()
-                    .strip_prefix(r"\\.\pipe\")
-                    .unwrap()
-            )
-        }
+        format!(
+            "socket,id={},path={},server=on,wait=off",
+            self.id,
+            self.path.to_str().unwrap().replace(',', ",,")
+        )
     }
 
     /// Open QEMU's endpoint without exposing a TCP fallback.
-    pub(crate) fn connect(&self, pid: u32, timeout: Duration) -> io::Result<Stream> {
+    pub(crate) fn connect(&self, timeout: Duration) -> io::Result<Stream> {
+        let stream = Stream::connect_path(&self.path, timeout)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let _ = pid;
-            let stream = Stream::connect_path(&self.path, timeout)?;
             std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
-            Ok(stream)
         }
-        #[cfg(windows)]
-        {
-            Stream::connect_qemu(&self.path, pid, timeout)
-        }
+        Ok(stream)
     }
 
     /// Locate a fake QEMU backend in transport tests.
@@ -133,7 +100,6 @@ impl Endpoint {
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        #[cfg(unix)]
         local::remove_socket(&self._directory.path().join("hw.sock"));
     }
 }
@@ -229,6 +195,118 @@ impl Channel {
 mod tests {
     use super::*;
 
+    /// QEMU exposes both monitor and hardware backends through private filesystem sockets.
+    #[test]
+    #[ignore = "requires QEMU"]
+    fn test_qemu_socket_backends() {
+        use std::process::{Child, Command};
+        use std::time::Instant;
+
+        /// Test child reaped even when a connection or assertion fails.
+        struct Guest(
+            /// QEMU process owned by this test.
+            Child,
+        );
+        impl Drop for Guest {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // Packaging tests use the exact sidecar shipped in their platform bundle
+        let binary = if let Some(path) = std::env::var_os("ARK_EMULATOR_TEST_QEMU") {
+            PathBuf::from(path)
+        } else {
+            let directory = std::env::var_os("ARK_EMULATOR_TEST_QEMU_DIR")
+                .expect("set ARK_EMULATOR_TEST_QEMU or ARK_EMULATOR_TEST_QEMU_DIR");
+            let binaries: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("qemu-system-guest-")
+                        && (path.extension().is_some_and(|ext| ext == "exe") == cfg!(windows))
+                })
+                .collect();
+            assert_eq!(binaries.len(), 1, "{binaries:?}");
+            binaries.into_iter().next().unwrap()
+        };
+        let monitor = Endpoint::new("qmp").unwrap();
+        let hardware = Endpoint::new("hw").unwrap();
+        let mut command = Command::new(binary);
+        command
+            .args([
+                "-machine",
+                "none",
+                "-display",
+                "none",
+                "-nodefaults",
+                "-S",
+                "-m",
+                "32",
+            ])
+            .arg("-chardev")
+            .arg(monitor.chardev())
+            .args(["-mon", "chardev=qmp,mode=control"])
+            .arg("-chardev")
+            .arg(hardware.chardev());
+        if let Some(libs) = std::env::var_os("ARK_EMULATOR_TEST_QEMU_LIBS") {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            command.env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(PathBuf::from(&libs)).chain(std::env::split_paths(&path)),
+                )
+                .unwrap(),
+            );
+            command.arg("-L").arg(libs);
+        }
+        let mut guest = Guest(command.spawn().unwrap());
+
+        // Startup may take several polls, but a failed child must surface immediately
+        let mut connect = |endpoint: &Endpoint| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(
+                    guest.0.try_wait().unwrap().is_none(),
+                    "QEMU exited before connecting"
+                );
+                match endpoint.connect(Duration::from_millis(100)) {
+                    Ok(stream) => break stream,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                        ) && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(err) => panic!("QEMU socket connection failed: {err}"),
+                }
+            }
+        };
+        let mut monitor = super::super::qmp::Monitor::new(connect(&monitor));
+        let _hardware = connect(&hardware);
+
+        // The backend exists without a guest driver opening its frontend
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "QEMU omitted hardware port state"
+            );
+            if let Some(open) = monitor.poll().unwrap() {
+                assert!(!open);
+                break;
+            }
+        }
+    }
+
     /// The channel directory is private before QEMU starts and removed on drop.
     #[cfg(unix)]
     #[test]
@@ -247,11 +325,7 @@ mod tests {
     /// Connect two native peers using the production endpoint and access checks.
     fn pair() -> (Channel, Channel, Endpoint, local::Server) {
         let (endpoint, server) = Endpoint::fixture();
-        let client = Channel::new(
-            endpoint
-                .connect(std::process::id(), Duration::from_secs(1))
-                .unwrap(),
-        );
+        let client = Channel::new(endpoint.connect(Duration::from_secs(1)).unwrap());
         let peer = Channel::new(
             server
                 .accept_timeout(Duration::from_secs(1))
@@ -351,16 +425,5 @@ mod tests {
             );
             sender.join().unwrap();
         }
-    }
-
-    /// A pipe with the expected name is insufficient unless QEMU owns it.
-    #[cfg(windows)]
-    #[test]
-    fn test_hardware_pipe_rejects_wrong_process() {
-        let (endpoint, _server) = Endpoint::fixture();
-        assert!(matches!(
-            endpoint.connect(0, Duration::from_secs(1)),
-            Err(err) if err.kind() == io::ErrorKind::PermissionDenied
-        ));
     }
 }

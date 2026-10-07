@@ -178,7 +178,7 @@ impl Runtime {
             .context("could not prepare the QEMU monitor")?;
         let mut child = spawn_qemu(&mut pending, disk, memory, env, &channel, &monitor)?;
         disk::mark_booted(disk);
-        self.hardware.start(channel, child.id(), Some(monitor));
+        self.hardware.start(channel, Some(monitor));
         if let Err(err) = discovery::register(
             pending.host_port.port(),
             disk,

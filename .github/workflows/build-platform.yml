@@ -280,7 +280,10 @@ jobs:
         run: cargo test --locked -p cli-tests --features packaged
 
       - name: Test native IPC
-        run: cargo test --locked -p cli-tests --features packaged --test ipc
+        env:
+          ARK_EMULATOR_TEST_QEMU_DIR: ${{ github.workspace }}/launcher/binaries
+          ARK_EMULATOR_TEST_QEMU_LIBS: ${{ github.workspace }}/launcher/qemu-libs
+        run: cargo test --locked -p cli-tests --features packaged --test ipc -- --include-ignored
 
       - name: Notarize and staple the disk image
         # The .app is already done, by the build. A .dmg is assessed on its own

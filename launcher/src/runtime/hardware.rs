@@ -191,13 +191,13 @@ impl Controller {
     }
 
     /// Start the sole hardware connection after QEMU has been spawned.
-    pub(crate) fn start(&self, endpoint: Endpoint, pid: u32, monitor: Option<Endpoint>) {
+    pub(crate) fn start(&self, endpoint: Endpoint, monitor: Option<Endpoint>) {
         let mut connection = self.0.connection.lock().unwrap();
         assert!(connection.is_none(), "hardware already started");
         self.update(|state| state.phase = Phase::Booting);
         let (buttons, receiver) = mpsc::sync_channel(16);
         let controller = self.clone();
-        let thread = thread::spawn(move || controller.run(endpoint, pid, receiver, monitor));
+        let thread = thread::spawn(move || controller.run(endpoint, receiver, monitor));
         *connection = Some(Connection { buttons, thread });
     }
 
@@ -282,30 +282,27 @@ impl Controller {
     }
 
     /// Attach when the guest listens, preserving pending handshakes during boot.
-    fn run(
-        &self,
-        endpoint: Endpoint,
-        pid: u32,
-        buttons: mpsc::Receiver<Button>,
-        monitor: Option<Endpoint>,
-    ) {
+    fn run(&self, endpoint: Endpoint, buttons: mpsc::Receiver<Button>, monitor: Option<Endpoint>) {
         while !self.0.stopping.load(Ordering::SeqCst) {
-            // Windows QEMU opens its monitor pipe before opening the hardware pipe
             let result = (|| -> Result<()> {
                 let monitor = monitor
                     .as_ref()
-                    .map(|endpoint| endpoint.connect(pid, RETRY).map(Monitor::new))
+                    .map(|endpoint| endpoint.connect(RETRY).map(Monitor::new))
                     .transpose()?;
 
-                // Retain the monitor while QEMU creates the hardware endpoint.
-                // Its Windows pipe cannot accept a replacement connection.
+                // Retain the monitor while QEMU creates the hardware endpoint
                 let socket = loop {
                     if self.0.stopping.load(Ordering::SeqCst) {
                         return Ok(());
                     }
-                    match endpoint.connect(pid, RETRY) {
+                    match endpoint.connect(RETRY) {
                         Ok(stream) => break Channel::new(stream),
-                        Err(err) if err.kind() == ErrorKind::NotFound => {
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                            ) =>
+                        {
                             thread::park_timeout(ENDPOINT_POLL);
                         }
                         Err(err) => return Err(err.into()),
@@ -577,7 +574,7 @@ mod tests {
     fn connect() -> (Controller, Server, Channel) {
         let (endpoint, listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(endpoint, std::process::id(), None);
+        controller.start(endpoint, None);
         let mut socket = accept(&listener);
         socket.send(HELLO).unwrap();
         assert_eq!(
@@ -759,7 +756,7 @@ mod tests {
     fn test_a_pending_boot_connection_is_not_replaced() {
         let (endpoint, listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(endpoint, std::process::id(), None);
+        controller.start(endpoint, None);
         let mut socket = accept(&listener);
         thread::sleep(Duration::from_millis(1200));
         assert!(
@@ -793,7 +790,7 @@ mod tests {
         drop(listener);
         let (monitor, monitor_listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(endpoint, std::process::id(), Some(monitor));
+        controller.start(endpoint, Some(monitor));
         let mut qmp = monitor_listener
             .accept_timeout(Duration::from_secs(5))
             .unwrap()
@@ -802,7 +799,7 @@ mod tests {
         assert_eq!(qmp.read(&mut [0]).unwrap_err().kind(), ErrorKind::TimedOut);
         assert!(!controller.snapshot().connected);
 
-        // Negotiate through the original monitor after the hardware pipe appears
+        // Negotiate through the original monitor after the hardware socket appears
         let listener = Server::bind(&name).unwrap();
         let worker = thread::spawn(move || {
             qmp.set_write_timeout(Duration::from_secs(2));
@@ -858,13 +855,13 @@ mod tests {
         drop(listener);
         let (monitor, monitor_listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(endpoint, std::process::id(), Some(monitor));
+        controller.start(endpoint, Some(monitor));
         let mut qmp = monitor_listener
             .accept_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
 
-        // Stop must wake the connection worker without waiting for a pipe
+        // Stop must wake the connection worker without waiting for a socket
         let (done, finished) = mpsc::channel();
         let stopping = controller.clone();
         let worker = thread::spawn(move || {
@@ -905,7 +902,7 @@ mod tests {
         let (endpoint, listener) = Endpoint::fixture();
         let (monitor, monitor_listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(endpoint, std::process::id(), Some(monitor));
+        controller.start(endpoint, Some(monitor));
         let mut qmp = BufReader::new(
             monitor_listener
                 .accept_timeout(Duration::from_secs(5))
@@ -1011,7 +1008,7 @@ mod tests {
         use std::io::Read as _;
         let (endpoint, listener) = Endpoint::fixture();
         let controller = Controller::default();
-        controller.start(endpoint, std::process::id(), None);
+        controller.start(endpoint, None);
         let mut stream = accept(&listener);
         let (done, finished) = mpsc::channel();
         let worker = controller.clone();

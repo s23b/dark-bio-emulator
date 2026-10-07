@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(monitor.poll().unwrap(), None);
         assert!(!monitor.open);
 
-        // interprocess flushes and closes Windows pipes on a background thread
+        // Observe peer closure within a bounded interval across host schedulers
         drop(peer);
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {

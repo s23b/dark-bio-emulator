@@ -27,14 +27,20 @@ Transfer-Encoding headers are rejected.
 The registry endpoint is named `registry-18180`. Each launch's control
 endpoint is named `c-ID`, where ID is its advertised launch id.
 
-On Unix, these are filesystem sockets under `/tmp/ark-emulator-UID/`, where
-UID is the effective user id. The directory has mode 0700 and sockets have
-mode 0600. Persistent registry lock files protect live listeners during stale
-socket recovery. Unique control endpoints need no lock file. Sockets are
-removed on listener drop and best-effort on normal process exit. On Windows,
-they are named pipes under `\\.\pipe\ark-emulator-SID-NAME`, restricted to the
-current user's SID and rejecting remote clients. Processes running as that
-user may connect.
+Every host uses filesystem Unix-domain sockets. On Unix, socket names live
+under `/tmp/ark-emulator-UID/`, where UID is the effective user id. The
+directory has mode 0700 and sockets have mode 0600.
+
+Windows uses native AF_UNIX sockets under the current user's local application
+data directory, in `ArkIPC`. Each filename is the first 32 lowercase hex
+characters of SHA-256 over the UTF-8 endpoint name. The directory is created
+with a user-only DACL that its sockets inherit. Clients verify directory
+ownership and access controls before connecting. Socket paths must fit within
+the host's AF_UNIX path limit. Processes running as the same user may connect.
+
+Persistent registry lock files protect live listeners during stale socket
+recovery. Unique control endpoints need no lock file. Sockets are removed on
+listener drop and best-effort on normal process exit.
 
 The browser port has one owner across OS users. If it is held without a
 private endpoint for the current user, close the other user's emulators,
@@ -46,7 +52,7 @@ The native registry serves these routes:
     POST   /v1/instances          a launcher publishing itself
     DELETE /v1/instances/<port>   a launcher withdrawing itself
 
-Access control belongs to the socket or pipe. Headers and bodies are each
+Access control belongs to filesystem permissions. Headers and bodies are each
 bounded to 8 KiB. Native endpoints do not serve browser preflights.
 
 Publishing and withdrawing answer 204 with no body. All running launchers
@@ -83,11 +89,11 @@ publishing a path. No path is ever published, since any page in any browser
 can read a loopback port.
 
 The Rust launcher owns the hardware connection in both window modes.
-The guest's `bio.dark.hw.v1` port connects through a private Unix socket or
-Windows named pipe. Each JSON message is COBS encoded and terminated by a zero
-byte, with a 64 KiB limit on the decoded message. The guest begins each
-session with `{"version":1}` and waits for the same acknowledgement before
-sending driver messages. A fresh greeting clears hardware state and advances
+The guest's `bio.dark.hw.v1` port connects through a private filesystem
+Unix-domain socket on every host. Each JSON message is COBS encoded and
+terminated by a zero byte, with a 64 KiB limit on the decoded message. The guest
+begins each session with `{"version":1}` and waits for the same acknowledgement
+before sending driver messages. A fresh greeting clears hardware state and advances
 the connection generation.
 The firmware's serial console remains a separate device.
 

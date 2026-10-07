@@ -443,12 +443,13 @@ name = "cli-tests"
 version = "0.0.0"
 dependencies = [
  "darkbio-cobs",
+ "dirs",
  "httparse",
- "interprocess",
  "libc",
  "semver",
  "serde_json",
  "sha2",
+ "socket2",
  "tempfile",
  "time",
  "tiny_http",
@@ -786,12 +787,6 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
-
-[[package]]
-name = "doctest-file"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
 
 [[package]]
 name = "dom_query"
@@ -1696,19 +1691,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "interprocess"
-version = "2.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb02ffbf25e8ef0f4a95bff054eef75f6d1bf16919474cf2caa63b21997478a"
-dependencies = [
- "doctest-file",
- "libc",
- "recvmsg",
- "widestring",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1849,7 +1831,6 @@ dependencies = [
  "darkbio-cobs",
  "dirs",
  "httparse",
- "interprocess",
  "libc",
  "rfd",
  "semver",
@@ -1857,6 +1838,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
+ "socket2",
  "tauri",
  "tauri-build",
  "tempfile",
@@ -2617,12 +2599,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
-name = "recvmsg"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3158,9 +3134,9 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "socket2"
-version = "0.6.3"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -4491,12 +4467,6 @@ dependencies = [
  "windows",
  "windows-core",
 ]
-
-[[package]]
-name = "widestring"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "winapi"

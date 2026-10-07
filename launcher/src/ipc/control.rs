@@ -817,7 +817,7 @@ mod tests {
         fn new() -> Self {
             let (endpoint, listener) = HardwareEndpoint::fixture();
             let hardware = Controller::default();
-            hardware.start(endpoint, std::process::id(), None);
+            hardware.start(endpoint, None);
             let peer = accept(&listener);
             wait_for(|| hardware.snapshot().connected);
             let control =
