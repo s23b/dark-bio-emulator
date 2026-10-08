@@ -6,12 +6,13 @@
 
 //! Isolated registry peers for HTTP failures and lifecycle scenarios.
 
+use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::discovery::Client;
-use super::{http, local, registry as registry_api};
+use super::{local, registry as registry_api};
 
 /// Reserve an isolated registry namespace without using the shared discovery port.
 pub(crate) fn server() -> (Client, local::Server, TcpListener) {
@@ -36,7 +37,7 @@ pub(crate) fn registry(replies: Vec<(&'static str, String)>) -> (Client, JoinHan
             assert_eq!(incoming.method().as_str(), method);
             let mut writer = incoming.into_writer();
             if !reply.is_empty() {
-                http::write_frame(&mut writer, reply.as_bytes()).unwrap();
+                writer.write_all(reply.as_bytes()).unwrap();
             }
         }
         drop(server);
@@ -45,7 +46,15 @@ pub(crate) fn registry(replies: Vec<(&'static str, String)>) -> (Client, JoinHan
     (client, worker)
 }
 
-/// Build an HTTP reply whose body ends at the enclosing COBS delimiter.
+/// Build a response with ordinary HTTP body framing.
 pub(crate) fn response(status: u16, body: &str) -> String {
-    format!("HTTP/1.0 {status} Test\r\n\r\n{body}")
+    if status == 204 {
+        assert!(body.is_empty());
+        format!("HTTP/1.1 {status} Test\r\nConnection: close\r\n\r\n")
+    } else {
+        format!(
+            "HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
 }

@@ -8,8 +8,7 @@
 //!
 //! Only native processes can reach these listeners. Their directories admit
 //! only the current user, through Unix permissions or Windows DACLs.
-//! Each connection carries one bounded request and one response. HTTP methods,
-//! routes and status codes sit inside zero-delimited COBS messages.
+//! Each connection carries one bounded HTTP request and one response.
 
 use std::cell::Cell;
 use std::fs::File;
@@ -591,46 +590,37 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    /// Parse one COBS-framed HTTP/1.0 request under size and time limits.
+    /// Parse one HTTP request under size and time limits.
     fn read(mut stream: Stream) -> io::Result<Self> {
-        let raw = match super::http::read_frame(&mut stream, 2 * MAX_REQUEST) {
-            Ok(raw) => raw,
+        let request = match super::http::read_request(&mut stream, MAX_REQUEST) {
+            Ok(request) => request,
             Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                return Self::reject(stream, 400);
+                let status = if err
+                    .get_ref()
+                    .is_some_and(|err| err.is::<super::http::TooLarge>())
+                {
+                    413
+                } else {
+                    400
+                };
+                return Self::reject(stream, status);
             }
             Err(err) => return Err(err),
         };
-        let Some(split) = raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-            return Self::reject(stream, 400);
-        };
-        let split = split + 4;
-        if split > MAX_REQUEST || raw.len() - split > MAX_REQUEST {
-            return Self::reject(stream, 413);
-        }
-        let mut fields = [httparse::EMPTY_HEADER; 32];
-        let mut parsed = httparse::Request::new(&mut fields);
-        if !matches!(
-            parsed.parse(&raw[..split]),
-            Ok(httparse::Status::Complete(_))
-        ) || parsed.version != Some(0)
-        {
-            return Self::reject(stream, 400);
-        }
-        let method = parsed
-            .method
-            .unwrap()
+        let method = request
+            .method()
+            .as_str()
             .parse::<Method>()
             .map_err(|()| io::Error::from(io::ErrorKind::InvalidData))?;
-        let path = parsed.path.unwrap().to_owned();
+        let path = request
+            .uri()
+            .path_and_query()
+            .map_or("/", |path| path.as_str())
+            .to_owned();
         let mut headers = Vec::new();
-        for field in parsed.headers {
-            if field.name.eq_ignore_ascii_case("Transfer-Encoding")
-                || field.name.eq_ignore_ascii_case("Content-Length")
-            {
-                return Self::reject(stream, 400);
-            }
+        for (name, value) in request.headers() {
             headers.push(
-                Header::from_bytes(field.name, field.value)
+                Header::from_bytes(name.as_str(), value.as_bytes())
                     .map_err(|()| io::Error::from(io::ErrorKind::InvalidData))?,
             );
         }
@@ -638,16 +628,17 @@ impl Request {
             method,
             path,
             headers,
-            body: raw[split..].to_vec(),
+            body: request.into_body(),
             stream,
         })
     }
 
     /// Reject framing before dispatching anything to an application handler.
     fn reject(mut stream: Stream, status: u16) -> io::Result<Self> {
-        let _ = super::http::write_frame(
-            &mut stream,
-            format!("HTTP/1.0 {status} Rejected\r\n\r\n").as_bytes(),
+        stream.set_write_timeout(IO_TIMEOUT);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         );
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -671,24 +662,36 @@ impl Request {
     pub(crate) fn body(&self) -> &[u8] {
         &self.body
     }
-    /// Send a COBS-framed HTTP response and release the native connection.
+    /// Send a response with its byte length and close the native connection.
     pub(crate) fn respond<R: Read>(mut self, response: Response<R>) -> io::Result<()> {
         let status = response.status_code();
         let mut raw = format!(
-            "HTTP/1.0 {} {}\r\n",
+            "HTTP/1.1 {} {}\r\nConnection: close\r\n",
             status.0,
             status.default_reason_phrase()
         )
         .into_bytes();
         for header in response.headers() {
-            if !header.field.equiv("Content-Length") && !header.field.equiv("Transfer-Encoding") {
+            if !header.field.equiv("Content-Length")
+                && !header.field.equiv("Transfer-Encoding")
+                && !header.field.equiv("Connection")
+            {
                 write!(raw, "{header}\r\n")?;
             }
         }
-        raw.extend_from_slice(b"\r\n");
-        response.into_reader().read_to_end(&mut raw)?;
+        let mut body = Vec::new();
+        response.into_reader().read_to_end(&mut body)?;
+        // These statuses have no response body, so no length is needed
+        if matches!(status.0, 100..=199 | 204 | 304) {
+            raw.extend_from_slice(b"\r\n");
+        } else {
+            write!(raw, "Content-Length: {}\r\n\r\n", body.len())?;
+            if self.method != Method::Head {
+                raw.extend_from_slice(&body);
+            }
+        }
         self.stream.set_write_timeout(IO_TIMEOUT);
-        super::http::write_frame(&mut self.stream, &raw)
+        self.stream.write_all(&raw)
     }
     /// Expose the response stream to scripted peers testing partial replies.
     #[cfg(test)]
@@ -790,10 +793,13 @@ mod tests {
             request.respond(Response::from_string("accepted")).unwrap();
         });
         let mut client = Stream::connect(&name, IO_TIMEOUT).unwrap();
-        super::super::http::write_frame(&mut client, b"GET /test HTTP/1.0\r\n\r\n").unwrap();
-        let reply = super::super::http::read_frame(client, 8192).unwrap();
+        client
+            .write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
         assert!(reply.ends_with(b"\r\n\r\naccepted"), "{reply:?}");
-        assert!(!reply.windows(14).any(|bytes| bytes == b"Content-Length"));
+        assert!(reply.windows(17).any(|bytes| bytes == b"Content-Length: 8"));
         worker.join().unwrap();
     }
 
@@ -1037,7 +1043,8 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         drop(stalled);
         let mut next = Stream::connect(&name, IO_TIMEOUT).unwrap();
-        super::super::http::write_frame(&mut next, b"GET /next HTTP/1.0\r\n\r\n").unwrap();
+        next.write_all(b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         assert_eq!(server.recv().unwrap().url(), "/next");
     }
 
@@ -1047,7 +1054,9 @@ mod tests {
         let name = format!("t-{}", identity());
         let server = Server::bind(&name).unwrap();
         let mut client = Stream::connect(&name, IO_TIMEOUT).unwrap();
-        super::super::http::write_frame(&mut client, b"GET /test HTTP/1.0\r\n\r\n").unwrap();
+        client
+            .write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut reply = server.recv().unwrap().into_writer();
 
         // An open socket with no response bytes remains idle

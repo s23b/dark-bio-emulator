@@ -472,7 +472,7 @@ fn request(
     Ok(reply.body)
 }
 
-/// Exchange one HTTP/1.0 request within a single deadline and response size limit.
+/// Exchange one HTTP request within a single deadline and response size limit.
 fn exchange(
     endpoint: &Endpoint,
     method: &str,
@@ -520,20 +520,14 @@ mod tests {
     use super::*;
     use crate::ipc::hardware::{Channel, Endpoint as HardwareEndpoint, HELLO};
     use serde_json::{Value, json};
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Instant;
 
-    /// Frame an HTTP reply for a peer that can cut its wire bytes short.
+    /// Build an HTTP reply for a peer that can cut its wire bytes short.
     fn response(status: u16, body: &str) -> Vec<u8> {
-        let mut encoded = Vec::new();
-        http::write_frame(
-            &mut encoded,
-            crate::ipc::testing::response(status, body).as_bytes(),
-        )
-        .unwrap();
-        encoded
+        crate::ipc::testing::response(status, body).into_bytes()
     }
 
     /// Serve direct control replies and release an optional guest at the end.
@@ -816,12 +810,10 @@ mod tests {
     /// Malformed and refused status replies remain failures after a stop is accepted.
     #[test]
     fn test_direct_stop_keeps_status_failures_visible() {
-        let mut malformed = Vec::new();
-        http::write_frame(&mut malformed, b"HTTP/1.0 200 OK\r\n").unwrap();
         for reply in [
-            b"\x08garbage\0".to_vec(),
-            b"\x06HTTP?\0".to_vec(),
-            malformed,
+            b"garbage\r\n\r\n".to_vec(),
+            b"HTTP?\r\n\r\n".to_vec(),
+            b"HTTP/1.1 invalid\r\n\r\n".to_vec(),
             response(200, "not json"),
             response(503, "status unavailable"),
         ] {
@@ -1268,25 +1260,27 @@ mod tests {
         let fixture = Fixture::new();
         let endpoint = &fixture.control.endpoint;
         let generation = fixture.hardware.snapshot().generation;
-        let length = format!("X-Ark-Generation: {generation}\r\nContent-Length: 0\r\n");
+        let ambiguous = format!(
+            "X-Ark-Generation: {generation}\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n"
+        );
         let chunked = format!("X-Ark-Generation: {generation}\r\nTransfer-Encoding: chunked\r\n");
         for (headers, body, expected) in [
-            ("", "x", 413),
-            ("", "x\0", 413),
+            ("Content-Length: 1\r\n", "x", 413),
+            ("Content-Length: 2\r\n", "x\0", 413),
             ("", "", 400),
             ("X-Ark-Generation: invalid\r\n", "", 400),
-            (length.as_str(), "", 400),
-            (chunked.as_str(), "", 400),
+            (ambiguous.as_str(), "", 400),
+            (chunked.as_str(), "1\r\nx\r\n0\r\n\r\n", 413),
         ] {
             let mut stream = Stream::connect(&endpoint.name(), Duration::from_secs(1)).unwrap();
             stream.set_read_timeout(Duration::from_secs(1));
-            http::write_frame(
-                &mut stream,
-                format!("POST /v1/button/press HTTP/1.0\r\nHost: localhost\r\n{headers}\r\n{body}")
-                    .as_bytes(),
+            write!(
+                stream,
+                "POST /v1/button/press HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n{body}"
             )
             .unwrap();
-            let response = String::from_utf8(http::read_frame(stream, 8192).unwrap()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
             assert_eq!(
                 response
                     .split_whitespace()

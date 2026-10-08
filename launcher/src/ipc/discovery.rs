@@ -5,7 +5,7 @@
 // license that can be found in the LICENSE file.
 
 //! The launcher's side of the registry: reading it, keeping this emulator's
-//! entry in it up to date, and COBS-framed HTTP messages over private local IPC.
+//! entry in it up to date, and HTTP messages over private local IPC.
 //!
 //! A refused connection means no registry is running. Connection loss can
 //! recover through host takeover; HTTP refusals, timeouts and malformed replies
@@ -476,9 +476,7 @@ mod tests {
             let heartbeat = server.recv().unwrap();
             assert_eq!(heartbeat.method().as_str(), "POST");
             let mut writer = heartbeat.into_writer();
-            writer
-                .write_all(b"\x1cHTTP/1.0 204 No Content\r\n")
-                .unwrap();
+            writer.write_all(b"HTTP/1.1 204 No Content\r\n").unwrap();
             drop(server);
             drop(reservation);
         });
@@ -521,8 +519,8 @@ mod tests {
             response(503, "registry unavailable"),
             response(200, "not json"),
             response(200, r#"{"version":999,"instances":[]}"#),
-            "garbage".to_owned(),
-            "HTTP?".to_owned(),
+            "garbage\r\n\r\n".to_owned(),
+            "HTTP?\r\n\r\n".to_owned(),
             "HTTP/1.0 invalid\r\n\r\n".to_owned(),
             "HTTP/1.0 999 Unknown\r\n\r\n".to_owned(),
         ] {

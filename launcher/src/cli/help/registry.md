@@ -18,11 +18,12 @@ routes are absent from this listener, regardless of the request headers.
 
 ## Native transport
 
-Native tools use COBS-framed HTTP/1.0 messages over local IPC, with one request
-and one response per connection. Each message contains the HTTP start line,
-headers, a blank line and the body, encoded with `darkbio-cobs` and terminated
-by a zero byte. The delimiter ends the body; Content-Length and
-Transfer-Encoding headers are rejected.
+Native tools use standard HTTP/1.1 with JSON bodies over local IPC. Each
+connection carries one request and one response, then closes. Senders use
+Content-Length for bodies. Receivers also accept chunked transfer encoding;
+requests without either header have no body. Clients accept responses ended
+by connection closure and informational responses before the final reply.
+Ambiguous framing and unsupported transfer codings are rejected.
 
 The registry endpoint is named `registry-18180`. Each launch's control
 endpoint is named `c-ID`, where ID is its advertised launch id.
@@ -59,10 +60,21 @@ The native registry serves these routes:
     DELETE /v1/instances/<port>   a launcher withdrawing itself
 
 Access control belongs to filesystem permissions. Headers and bodies are each
-bounded to 8 KiB. Native endpoints do not serve browser preflights.
+bounded to 8 KiB for requests. Clients bound response bodies to 4 KiB for
+control and 1 MiB for listings. Header blocks, including informational
+responses, share an 8 KiB limit. Chunked bodies allow at most eight times the
+decoded body limit plus 8 KiB of wire data, with at most 8 KiB pending at once.
+Partial reads and writes share a deadline. Native endpoints do not serve
+browser preflights.
 
-Publishing and withdrawing answer 204 with no body. All running launchers
-must support native IPC; restart them after updating.
+An HTTP client can read a registry socket directly:
+
+    curl --unix-socket "$SOCKET" http://localhost/v1/instances
+
+`SOCKET` is the full filesystem path of the registry endpoint above.
+
+Publishing and withdrawing answer 204 with no body. Update native clients
+and restart all running launchers together.
 
 ## The listing
 

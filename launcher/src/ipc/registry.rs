@@ -418,7 +418,7 @@ mod tests {
         }
     }
 
-    /// Send a COBS-framed HTTP request through an isolated registry listener.
+    /// Send an HTTP request through an isolated registry listener.
     fn exchange(
         registry: &mut Registry,
         method: &str,
@@ -433,12 +433,7 @@ mod tests {
         let mut stream = local::Stream::connect(server.name(), timeout).unwrap();
         stream.set_read_timeout(timeout);
         stream.set_write_timeout(timeout);
-        super::super::http::write_frame(
-            &mut stream,
-            format!("{method} {path} HTTP/1.0\r\nHost: {address}\r\n{headers}\r\n{body}")
-                .as_bytes(),
-        )
-        .unwrap();
+        write!(stream, "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\n{headers}\r\n{body}", body.len()).unwrap();
 
         // Exercise routing and header parsing before inspecting the reply
         match server.recv_timeout(timeout) {
@@ -446,8 +441,21 @@ mod tests {
             Err(err) if err.kind() == io::ErrorKind::InvalidData => {}
             result => panic!("request was not received: {}", result.err().unwrap()),
         }
-        let response =
-            String::from_utf8(super::super::http::read_frame(stream, 16384).unwrap()).unwrap();
+        // Framing completes the reply even if rejected unread input resets the socket
+        use std::io::{BufRead as _, BufReader};
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        while !response.ends_with("\r\n\r\n") {
+            assert!(reader.read_line(&mut response).unwrap() > 0);
+        }
+        let head = parse_reply(&response);
+        let length = head
+            .headers
+            .get("content-length")
+            .map_or(0, |value| value.parse::<usize>().unwrap());
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        response.push_str(std::str::from_utf8(&body).unwrap());
         parse_reply(&response)
     }
 

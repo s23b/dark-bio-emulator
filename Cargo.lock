@@ -444,7 +444,6 @@ version = "0.0.0"
 dependencies = [
  "darkbio-cobs",
  "dirs",
- "httparse",
  "libc",
  "polling",
  "semver",
@@ -454,6 +453,7 @@ dependencies = [
  "tempfile",
  "time",
  "tiny_http",
+ "ureq-proto",
  "windows-sys 0.59.0",
 ]
 
@@ -1846,7 +1846,6 @@ dependencies = [
  "console",
  "darkbio-cobs",
  "dirs",
- "httparse",
  "libc",
  "polling",
  "rfd",
@@ -1865,6 +1864,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "ureq-proto",
  "webview2-com",
  "windows-core",
  "windows-sys 0.59.0",
