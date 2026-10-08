@@ -86,7 +86,11 @@ fn main() {
     }
     let output = output::Output::new(&cli.global);
     desktop::reporting(&output, cli.global.no_input || cli.boot.headless);
-    diagnostics::level(cli.global.log);
+    diagnostics::init(
+        &output,
+        cli.global.log,
+        cli.version || cli.command.is_some(),
+    );
 
     // This reads compiled metadata without initializing a window system
     let context = tauri::generate_context!();
@@ -106,15 +110,12 @@ fn main() {
 
     // A source build gives stdout to the guest console in either launch mode
     output.release_stdout();
-    if output.json() {
-        diagnostics::log_sink(diagnostics::Sink::Events(output.clone()));
-    }
     if cli.boot.headless {
         update::start(&output, time::OffsetDateTime::now_utc());
         let result = Paths::resolve(&context.config().identifier, context.package_info())
             .and_then(|paths| cli::headless(&paths, cli.boot, output.clone()));
         if let Err(err) = result {
-            diagnostics::log!("[launcher] could not start: {err:#}");
+            tracing::debug!("could not start: {:#}", err);
             output.error(&Error::io(format!("{err:#}")));
             runtime::shut_down(1);
         }

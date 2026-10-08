@@ -23,10 +23,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use tracing::debug;
 
 use crate::bundle::{Firmware, Paths, resolve_firmware, resolve_qemu_libs};
 use crate::cli::args::Boot;
-use crate::diagnostics::{self, log};
+use crate::diagnostics;
 use crate::ipc::{control, discovery, registry};
 use crate::platform;
 use crate::settings::{DEFAULT_ENV, DEFAULT_MEMORY, Settings};
@@ -106,13 +107,13 @@ pub(crate) fn prepare(
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("could not create the data directory {}", data_dir.display()))?;
     if let Err(err) = diagnostics::log_to(data_dir, host_port.port()) {
-        log!("[launcher] could not open a log file: {err:#}");
+        debug!("could not open a log file: {:#}", err);
     }
     let settings = Settings::load(data_dir)?;
     diagnostics::record_path("Settings", settings.path());
     registry::host(discovery::CLIENT.address).context("could not host the emulator registry")?;
     let booted = discovery::CLIENT
-        .list()
+        .list(|warning| tracing::warn!("{}", warning))
         .context("could not discover running emulators")?;
     let firmware = resolve_firmware(paths.resources.as_deref(), &boot, arch)?;
     diagnostics::record_path("Kernel", &firmware.kernel);
@@ -195,7 +196,7 @@ impl Runtime {
             thread::spawn(move || {
                 for line in BufReader::new(stderr).lines() {
                     match line {
-                        Ok(line) => log!("[qemu] {line}"),
+                        Ok(line) => debug!(target: "ark_emulator::qemu", "{}", line),
                         Err(_) => break,
                     }
                 }
@@ -211,7 +212,7 @@ impl Runtime {
             drop(control);
             discovery::deregister();
             let result = result.and_then(|status| {
-                log!("[launcher] QEMU exited with {status}");
+                debug!("QEMU exited with {}", status);
                 if status.success() || stopping() || platform::interrupted(status).is_some() {
                     Ok(status)
                 } else {
@@ -247,10 +248,10 @@ fn wait(child: &mut Child, hardware: &Controller) -> Result<ExitStatus> {
 /// Stop and reap the guest after a launcher failure, preserving the original error.
 fn stop_child(child: &mut Child) {
     if let Err(err) = child.kill() {
-        log!("[launcher] could not stop QEMU after a failure: {err}");
+        debug!("could not stop QEMU after a failure: {}", err);
         return;
     }
     if let Err(err) = child.wait() {
-        log!("[launcher] could not reap QEMU after a failure: {err}");
+        debug!("could not reap QEMU after a failure: {}", err);
     }
 }

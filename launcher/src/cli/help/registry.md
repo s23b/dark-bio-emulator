@@ -97,10 +97,15 @@ can read a loopback port.
 The Rust launcher owns the hardware connection in both window modes.
 The guest's `bio.dark.hw.v1` port connects through a private filesystem
 Unix-domain socket on every host. Each JSON message is COBS encoded and
-terminated by a zero byte, with a 64 KiB limit on the decoded message. The guest
-begins each session with `{"version":1}` and waits for the same acknowledgement
-before sending driver messages. A fresh greeting clears hardware state and advances
-the connection generation.
+terminated by a zero byte, with a 64 KiB limit on the decoded message.
+The guest begins each session with a greeting containing `version: 1` and a
+fresh `session` nonce encoded as 32 hexadecimal characters. For example:
+
+    {"version":1,"session":"0123456789abcdef0123456789abcdef"}
+
+The launcher echoes the greeting before either side sends driver messages.
+A leading zero separates the greeting from stale partial frames.
+A fresh greeting clears hardware state and advances the connection generation.
 The firmware's serial console remains a separate device.
 
 An optional `control` object contains an opaque launch `id` naming its native

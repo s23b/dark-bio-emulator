@@ -38,11 +38,12 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context as _, Result, bail};
 
 use crate::bundle::resolve_sidecar;
-use crate::diagnostics::{self, log};
+use crate::diagnostics;
 use crate::platform::orphan;
 use crate::platform::{
     accel_flags, library_path_var, prepend_library_path, suppress_child_console,
 };
+use tracing::debug;
 
 /// CPU architecture of the firmware being booted, in the same docker-style
 /// vocabulary the firmware build names its artifacts with.
@@ -296,7 +297,7 @@ pub(crate) fn ensure_disk(path: &Path, qemu_libs: Option<&Path>) -> Result<()> {
 /// Create a blank qcow2 image, replacing any existing contents at `path`.
 /// The caller must first reject images used by a running emulator.
 pub(crate) fn create_disk(path: &Path, qemu_libs: Option<&Path>) -> Result<()> {
-    log!("[launcher] creating qcow2 image at {}", path.display());
+    debug!("creating qcow2 image at {}", path.display());
     // qcow2 is sparse on every host, including Windows NTFS where a raw
     // set_len would zero-fill the whole file. Delegated to qemu-img rather
     // than hand-writing the format. The bare byte count is read as bytes.
@@ -311,8 +312,8 @@ pub(crate) fn create_disk(path: &Path, qemu_libs: Option<&Path>) -> Result<()> {
         // qemu-img says what it could not do and why on stderr; its stdout is
         // just the format line, which belongs in the log rather than in front
         // of the user.
-        log!(
-            "[qemu-img] {}",
+        debug!(
+            target: "ark_emulator::qemu_img", "{}",
             String::from_utf8_lossy(&output.stdout).trim()
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -346,14 +347,11 @@ pub(crate) fn spawn_qemu(
     let native = arch.host();
     let qemu = resolve_qemu(arch);
     let origin = if qemu.bundled { "bundled" } else { "on PATH" };
-    log!(
-        "[launcher] using the {origin} QEMU at {}",
-        qemu.binary.display()
-    );
+    debug!("using the {} QEMU at {}", origin, qemu.binary.display());
     diagnostics::record("QEMU", format!("{} ({origin})", qemu.binary.display()));
     let mut cmd = qemu.command(qemu_libs);
     if let Some(libs) = qemu_libs {
-        log!("[launcher] passing -L {} to QEMU", libs.display());
+        debug!("passing -L {} to QEMU", libs.display());
         // -L points QEMU at its firmware/BIOS/keymap datadir, e.g.
         // bios-256k.bin, which the q35 machine model needs even for a direct
         // -kernel boot since SeaBIOS still runs first. QEMU looks up only the

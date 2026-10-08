@@ -323,12 +323,7 @@ pub(crate) fn stop(endpoint: &Endpoint, guest_port: u16, deadline: Instant) -> R
                         .error());
                 }
             }
-            Err(Failure::Transport(err))
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                ) =>
-            {
+            Err(Failure::MissingEndpoint) => {
                 if guest_gone(guest_port, deadline)? {
                     return Ok(());
                 }
@@ -363,6 +358,8 @@ fn guest_gone(port: u16, deadline: Instant) -> Result<bool, Error> {
 /// Control failures retaining connection loss for shutdown confirmation.
 #[derive(Debug)]
 enum Failure {
+    /// The advertised socket was absent before any request could be sent.
+    MissingEndpoint,
     /// Failed socket operation, including the overall request deadline.
     Transport(io::Error),
     /// HTTP refusal with the launcher's explanation.
@@ -388,6 +385,10 @@ impl Failure {
     /// Preserve the refusal and map it into the command line's exit classes.
     fn error(self) -> Error {
         let (code, message) = match self {
+            Self::MissingEndpoint => (
+                Code::ControlUnsupported,
+                "the emulator's control endpoint is missing".to_owned(),
+            ),
             Self::Transport(err) => {
                 let code = if matches!(
                     err.kind(),
@@ -483,7 +484,16 @@ fn exchange(
     if endpoint.id.len() != 64 || !endpoint.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Failure::Invalid("invalid emulator control endpoint"));
     }
-    let stream = Stream::connect(&endpoint.name(), remaining(deadline)?)?;
+    let stream = Stream::connect(&endpoint.name(), remaining(deadline)?).map_err(|err| {
+        if matches!(
+            err.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ) {
+            Failure::MissingEndpoint
+        } else {
+            Failure::Transport(err)
+        }
+    })?;
     let generation = generation.map(|value| value.to_string());
     let headers: Vec<_> = generation
         .as_deref()
@@ -504,6 +514,7 @@ fn exchange(
     })
 }
 
+/// Direct control, delivery uncertainty and guest reconnection regressions.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +729,33 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A missing socket fails before shutdown polling, whether the guest is alive or gone.
+    #[test]
+    fn test_missing_control_endpoint_requires_an_update_and_restart() {
+        for running in [false, true] {
+            // Reserve a guest port and choose whether it remains reachable
+            let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = guest.local_addr().unwrap().port();
+            let _guest = running.then_some(guest);
+            let endpoint = Endpoint {
+                id: local::identity(),
+            };
+
+            // Neither lifecycle nor button input can reach an absent endpoint
+            let stopped = stop(&endpoint, port, Instant::now() + Duration::from_secs(1));
+            let pressed = button(&endpoint, true, None, Duration::from_secs(1));
+            for err in [stopped.unwrap_err(), pressed.unwrap_err()] {
+                assert_eq!(err.code, Code::ControlUnsupported, "running={running}");
+                assert!(
+                    err.hints
+                        .iter()
+                        .any(|hint| hint.contains("update") && hint.contains("restart")),
+                    "running={running}"
+                );
+            }
+        }
+    }
+
     /// A stale endpoint cannot stop another launcher using the same guest port.
     #[test]
     fn test_direct_stop_observes_a_replacement_without_controlling_it() {
@@ -730,7 +768,7 @@ mod tests {
         let replacement =
             Control::start(Controller::default(), move || called.send(()).unwrap()).unwrap();
         let err = stop(&endpoint, port, Instant::now() + Duration::from_millis(250)).unwrap_err();
-        assert_eq!(err.code, Code::Timeout);
+        assert_eq!(err.code, Code::ControlUnsupported);
         assert!(received.try_recv().is_err());
         let reply = exchange(
             &replacement.endpoint,
@@ -1271,7 +1309,7 @@ mod tests {
             button(&stale, true, None, Duration::from_secs(1))
                 .unwrap_err()
                 .code,
-            Code::ControlUnreachable
+            Code::ControlUnsupported
         );
         assert!(!fixture.hardware.snapshot().pressed);
     }

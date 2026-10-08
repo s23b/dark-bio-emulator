@@ -21,9 +21,9 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::diagnostics::log;
 use crate::ipc::hardware::{Channel, Endpoint, FrameTooLarge};
 use crate::ipc::qmp::Monitor;
+use tracing::debug;
 
 /// Pause between failed connections, including while the guest is booting.
 const RETRY: Duration = Duration::from_secs(1);
@@ -311,7 +311,7 @@ impl Controller {
                 self.serve(socket, &buttons, monitor)
             })();
             if let Err(err) = result {
-                log!("[hardware] connection ended: {err:#}");
+                debug!("connection ended: {:#}", err);
             }
             self.disconnect();
             while let Ok(button) = buttons.try_recv() {
@@ -369,7 +369,7 @@ impl Controller {
                 socket.synchronize(&text)?;
                 generation = self.snapshot().generation;
                 self.update(|state| state.connected = true);
-                log!("[hardware] connected to guest");
+                debug!("connected to guest");
             }
 
             // Service deadlines even while inputs or LED frames arrive continuously
@@ -416,11 +416,11 @@ impl Controller {
                         monitor.refresh()?;
                     }
                 }
-                Ok(_) if generation == 0 => log!("[hardware] ignoring stale frame before greeting"),
+                Ok(_) if generation == 0 => debug!("ignoring stale frame before greeting"),
                 Ok(text) => match self.frame(text.as_str()) {
                     Ok(Some(reply)) => socket.send(&reply)?,
                     Ok(None) => {}
-                    Err(err) => log!("[hardware] ignoring malformed frame: {err}"),
+                    Err(err) => debug!("ignoring malformed frame: {}", err),
                 },
                 Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(err)
@@ -432,7 +432,7 @@ impl Controller {
                     if err.kind() == ErrorKind::InvalidData
                         && !err.get_ref().is_some_and(|err| err.is::<FrameTooLarge>()) =>
                 {
-                    log!("[hardware] discarding partial frame: {err}");
+                    debug!("discarding partial frame: {}", err);
                 }
                 Err(err) => return Err(err.into()),
             }

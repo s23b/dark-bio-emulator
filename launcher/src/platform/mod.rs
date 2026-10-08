@@ -35,7 +35,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::diagnostics::{self, log};
+use crate::diagnostics;
+use tracing::debug;
 
 pub(crate) mod orphan;
 
@@ -316,8 +317,8 @@ fn native_accel_flags() -> &'static [&'static str] {
     if kvm_available() {
         &["-accel", "kvm", "-accel", "tcg"]
     } else {
-        log!(
-            "[launcher] /dev/kvm is not accessible; falling back to software \
+        debug!(
+            "/dev/kvm is not accessible; falling back to software \
              emulation, which will be slower. Access normally comes from \
              membership of the kvm group."
         );
@@ -325,13 +326,10 @@ fn native_accel_flags() -> &'static [&'static str] {
     }
 }
 
-/// Whether KVM is usable, meaning `/dev/kvm` exists and this user may open it
-/// for reading and writing, which normally comes from the `kvm` group.
+/// Checks whether this user can read and write `/dev/kvm`.
 ///
-/// Probed for the same reason as [`hvf_available`] and [`whpx_probe`]: QEMU's
-/// `-accel kvm,tcg` list is not the clean fallback it looks like, and a
-/// refused `/dev/kvm` is much the most common way for a Linux host to end up
-/// without acceleration.
+/// Access normally comes from membership in the `kvm` group. A failed probe
+/// selects software emulation before QEMU starts.
 #[cfg(target_os = "linux")]
 fn kvm_available() -> bool {
     // SAFETY: a null-terminated literal in, a status code out. `access` reads
@@ -344,8 +342,8 @@ fn native_accel_flags() -> &'static [&'static str] {
     if hvf_available() {
         &["-accel", "hvf", "-accel", "tcg"]
     } else {
-        log!(
-            "[launcher] Hypervisor.framework unavailable on this Mac; \
+        debug!(
+            "Hypervisor.framework unavailable on this Mac; \
              falling back to software emulation, which will be slower"
         );
         &["-accel", "tcg"]
@@ -357,11 +355,12 @@ fn native_accel_flags() -> &'static [&'static str] {
     match whpx_probe() {
         Ok(()) => &["-accel", "whpx", "-accel", "tcg"],
         Err(reason) => {
-            log!(
-                "[launcher] Windows Hypervisor Platform unusable ({reason:#}); falling \
+            debug!(
+                "Windows Hypervisor Platform unusable ({:#}); falling \
                  back to software emulation, which will be slower. If the feature is \
                  simply switched off, enable it with: DISM /online /Enable-Feature \
-                 /FeatureName:HypervisorPlatform /All"
+                 /FeatureName:HypervisorPlatform /All",
+                reason
             );
             &["-accel", "tcg"]
         }

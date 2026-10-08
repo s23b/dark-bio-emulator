@@ -36,6 +36,8 @@ console = "0.16"
 dirs = "6"
 darkbio-cobs = "1"
 tempfile = "3"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry"] }
 
 # Orphan cleanup is OS-specific: PDEATHSIG (Linux) needs libc; macOS uses a
 # death pipe + /bin/sh (std only). Windows needs windows-sys for a Job Object,

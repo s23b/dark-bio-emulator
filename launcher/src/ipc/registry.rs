@@ -35,7 +35,7 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use super::local::{self, Request};
 
-use crate::diagnostics::log;
+use tracing::debug;
 
 /// Port the registry is served on. One below the first port an emulator takes,
 /// so the whole emulator range reads as one contiguous block.
@@ -108,17 +108,21 @@ pub(crate) struct Listing {
 /// An entry together with when it was last refreshed, which is the only thing
 /// keeping it alive.
 struct Entry {
+    /// Published discovery metadata for one emulator.
     instance: Instance,
+    /// Time of this launcher's last publication.
     seen: Instant,
 }
 
 /// The registry itself: every emulator that has been heard from, keyed by the
 /// port it holds.
 struct Registry {
+    /// Live publications indexed by their forwarded guest ports.
     entries: HashMap<u16, Entry>,
 }
 
 impl Registry {
+    /// Starts an empty registry before any launchers publish.
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
@@ -194,7 +198,7 @@ pub(crate) fn host(addr: SocketAddrV4) -> io::Result<bool> {
     let native = local::Server::bind_test(&local_name(addr.port()))?;
     let registry = Arc::new(Mutex::new(Registry::new()));
     let public_registry = registry.clone();
-    log!("[registry] hosting the registry on {addr}");
+    debug!("hosting the registry on {}", addr);
 
     // Runs for the life of the process. This launcher exiting is what hands
     // the port to the next one.
@@ -253,7 +257,7 @@ fn serve(server: &local::Server, registry: &Mutex<Registry>) {
             Ok(None) => {}
             // A failed accept says nothing about the other clients, so keep
             // serving.
-            Err(e) => log!("[registry] could not accept a request: {e}"),
+            Err(e) => debug!("could not accept a request: {}", e),
         }
         registry.lock().unwrap().expire(Instant::now());
     }
@@ -669,6 +673,7 @@ mod tests {
         );
     }
 
+    /// Builds a publication before the guest has reported its nameplate.
     fn instance(port: u16) -> Instance {
         Instance {
             port,
@@ -683,6 +688,7 @@ mod tests {
         }
     }
 
+    /// Entries disappear after their heartbeat lifetime elapses.
     #[test]
     fn test_expiry_drops_a_stale_entry() {
         let mut registry = Registry::new();
@@ -696,6 +702,7 @@ mod tests {
         assert!(registry.listing().instances.is_empty());
     }
 
+    /// Refreshing an entry keeps it visible in discovery.
     #[test]
     fn test_a_refresh_keeps_an_entry_alive() {
         let mut registry = Registry::new();
@@ -706,6 +713,7 @@ mod tests {
         assert_eq!(registry.listing().instances.len(), 1);
     }
 
+    /// A new publication clears claims omitted from the new record.
     #[test]
     fn test_a_refresh_replaces_rather_than_merges() {
         let mut registry = Registry::new();
@@ -717,6 +725,7 @@ mod tests {
         assert_eq!(registry.listing().instances[0].name, None);
     }
 
+    /// Repeated withdrawals keep the entry absent.
     #[test]
     fn test_removing_an_entry_is_idempotent() {
         let mut registry = Registry::new();
@@ -726,6 +735,7 @@ mod tests {
         assert!(registry.listing().instances.is_empty());
     }
 
+    /// Listings retain port order regardless of publication order.
     #[test]
     fn test_listing_is_ordered_by_port() {
         let mut registry = Registry::new();
@@ -741,6 +751,7 @@ mod tests {
         assert_eq!(ports, [18181, 18182, 18183]);
     }
 
+    /// Published claims survive serialization while unknown claims stay absent.
     #[test]
     fn test_an_instance_survives_a_json_roundtrip() {
         let mut original = instance(18182);
@@ -754,10 +765,11 @@ mod tests {
         assert!(decoded.ready);
         assert_eq!(decoded.name.as_deref(), Some("test ark"));
         assert_eq!(decoded.serial.as_deref(), Some("abc123"));
-        // Claims the device has not made are left out rather than sent as null.
+        // Claims the device has not made are left out rather than sent as null
         assert!(!String::from_utf8(encoded).unwrap().contains("expiry"));
     }
 
+    /// Repeated hosting attempts leave the existing registry in place.
     #[test]
     fn test_hosting_twice_from_one_process_is_refused() {
         // The second call is the one a heartbeat makes after a failed publish.
@@ -769,6 +781,7 @@ mod tests {
         assert!(!host(super::super::discovery::CLIENT.address).unwrap());
     }
 
+    /// A launcher cannot host while another listener holds the browser port.
     #[test]
     fn test_only_one_launcher_can_host_the_registry() {
         // Whoever binds first serves; the rest report a lost race rather than

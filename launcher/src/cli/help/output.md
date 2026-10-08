@@ -48,12 +48,13 @@ update check.
 
 ## Log files
 
-Every emulator writes its launcher's own lines to a file under the data
-directory, named after the port it holds, replacing what an earlier emulator
-on that port left there. `doctor --json` names the directory, and
-`list --json` names each emulator's file. The file holds the launcher's lines
-and what QEMU said, and never anything from the device, since an emulator's
-guest prints nothing at all.
+Every emulator writes diagnostics as JSON Lines under the data directory,
+named after its port, replacing the file from the previous launch there.
+Each record carries `level`, `target` and `fields`, with the formatted message
+in `fields.message`. `doctor --json` names the directory, and `list --json`
+names each emulator's file. `start --log debug` relays those records while it
+waits for readiness. The file holds launcher diagnostics and QEMU's stderr;
+the firmware console uses a separate stream.
 
 ## Errors
 
@@ -89,9 +90,10 @@ object whose one member is `error`. The codes are stable.
 - registry-unreachable: the registry could not be read or refused a command.
   HTTP refusals include the status and server explanation. Update Ark Emulator
   and restart all launchers when the refusal is caused by mixed versions. Exit 3.
-- control-unsupported: the emulator does not advertise direct control or
-  does not support the requested stop or button route. Update Ark Emulator
-  and restart every running emulator, including the registry host. Exit 3.
+- control-unsupported: the emulator does not advertise direct control, its
+  socket is missing, or it does not support the requested stop or button route.
+  Update Ark Emulator and restart every running emulator, including the
+  registry host. Exit 3.
 - control-unreachable: the launcher's control endpoint could not be reached
   or understood. Check `ark-emulator list` and retry against the current
   emulator. A failed stop can still be shutting down; inspect its window or

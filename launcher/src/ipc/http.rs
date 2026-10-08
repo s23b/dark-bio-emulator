@@ -113,7 +113,8 @@ pub(super) fn parse_response(raw: &[u8]) -> io::Result<Response> {
     if !matches!(
         response.parse(&raw[..split]),
         Ok(httparse::Status::Complete(_))
-    ) || !response.code.is_some_and(|code| (100..600).contains(&code))
+    ) || response.version != Some(0)
+        || !response.code.is_some_and(|code| (100..600).contains(&code))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -210,7 +211,7 @@ mod tests {
     fn test_complete_responses() {
         for (raw, status, body) in [
             ("HTTP/1.0 204 No Content\r\n\r\n", 204, ""),
-            ("HTTP/1.1 200 OK\r\n\r\n{\"a\":1}", 200, "{\"a\":1}"),
+            ("HTTP/1.0 200 OK\r\n\r\n{\"a\":1}", 200, "{\"a\":1}"),
             (
                 "HTTP/1.0 400 Bad Request\r\n\r\ninvalid input",
                 400,
@@ -243,6 +244,7 @@ mod tests {
             "HTTP/1.0 200 OK\r\n",
             "HTTP/1.0 invalid\r\n\r\n",
             "HTTP/1.0 999 Unknown\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n\r\n{}",
             "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n",
             "HTTP/1.0 200 OK\r\nContent-Length: invalid\r\n\r\n",
             "HTTP/1.0 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
