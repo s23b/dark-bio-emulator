@@ -20,6 +20,8 @@
 //! a heartbeat. See [`super::discovery`] for takeover and failure handling.
 //!
 //! Browser discovery allows every origin and publishes basenames, never paths.
+//! It accepts bodyless requests with at most 8 KiB of headers and a 2 s read
+//! deadline. Four workers isolate slow clients while bounding concurrent work.
 //! Lifecycle commands use [`super::control`] without consulting the registry
 //! again after selecting targets.
 
@@ -31,7 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use tiny_http::{Header, Method, Response, StatusCode};
 
 use super::local::{self, Request};
 
@@ -52,6 +54,11 @@ const ENTRY_TTL: Duration = Duration::from_secs(15);
 /// How often the serve loop wakes up with no request to handle, which is what
 /// bounds how late an entry's expiry can be.
 const TICK: Duration = Duration::from_millis(500);
+
+/// Maximum concurrent browser requests, including incomplete headers and replies.
+const PUBLIC_WORKERS: usize = 4;
+/// Deadline shared by every partial read of one browser request's headers.
+const PUBLIC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A running emulator, as published to whoever asks. Also the body a launcher
 /// registers itself with, so the two never drift apart.
@@ -188,30 +195,20 @@ pub(crate) fn host(addr: SocketAddrV4) -> io::Result<bool> {
         }
     };
 
-    // tiny_http takes an already-bound listener, so the bind above is what
-    // decides the race.
-    let server = Server::from_listener(listener, None::<tiny_http::SslConfig>)
-        .map_err(|e| io::Error::other(format!("could not serve on {addr}: {e}")))?;
     #[cfg(not(test))]
     let native = local::Server::bind(&local_name(addr.port()))?;
     #[cfg(test)]
     let native = local::Server::bind_test(&local_name(addr.port()))?;
     let registry = Arc::new(Mutex::new(Registry::new()));
-    let public_registry = registry.clone();
+    let listener = Arc::new(listener);
     debug!("hosting the registry on {}", addr);
 
-    // Runs for the life of the process. This launcher exiting is what hands
-    // the port to the next one.
-    thread::spawn(move || {
-        for request in server.incoming_requests() {
-            let listing = {
-                let mut registry = public_registry.lock().unwrap();
-                registry.expire(Instant::now());
-                registry.listing()
-            };
-            handle_public(request, &listing, addr);
-        }
-    });
+    // A fixed pool bounds partial requests without blocking native heartbeats
+    for _ in 0..PUBLIC_WORKERS {
+        let listener = listener.clone();
+        let registry = registry.clone();
+        thread::spawn(move || serve_public(&listener, &registry, addr));
+    }
     thread::spawn(move || serve(&native, &registry));
     Ok(true)
 }
@@ -221,8 +218,39 @@ pub(super) fn local_name(port: u16) -> String {
     format!("registry-{port}")
 }
 
+/// Serve browser requests without reading or draining a declared request body.
+fn serve_public(listener: &TcpListener, registry: &Mutex<Registry>, addr: SocketAddrV4) {
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(err) => {
+                debug!("could not accept a browser request: {}", err);
+                thread::sleep(TICK);
+                continue;
+            }
+        };
+        let request = match local::Stream::new(stream.into(), PUBLIC_TIMEOUT)
+            .and_then(|stream| Request::read(stream, 0))
+        {
+            Ok(request) => request,
+            Err(err) => {
+                debug!("could not read a browser request: {}", err);
+                continue;
+            }
+        };
+
+        // Release the registry lock before writing to an untrusted client
+        let listing = {
+            let mut registry = registry.lock().unwrap();
+            registry.expire(Instant::now());
+            registry.listing()
+        };
+        handle_public(request, &listing, addr);
+    }
+}
+
 /// Serve only browser discovery; no request can reach a native mutation route.
-fn handle_public(request: tiny_http::Request, listing: &Listing, addr: SocketAddrV4) {
+fn handle_public(request: Request, listing: &Listing, addr: SocketAddrV4) {
     let hosts: Vec<_> = request
         .headers()
         .iter()
@@ -378,8 +406,8 @@ mod tests {
         headers: &str,
         host: Option<&str>,
     ) -> Reply {
-        let server = Server::http((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let address = server.server_addr().to_ip().unwrap();
+        let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = server.local_addr().unwrap();
         let mut stream = TcpStream::connect(address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -390,7 +418,9 @@ mod tests {
             host.unwrap_or(&address.to_string())
         )
         .unwrap();
-        let request = server.recv().unwrap();
+        let (peer, _) = server.accept().unwrap();
+        let peer = local::Stream::new(peer.into(), PUBLIC_TIMEOUT).unwrap();
+        let request = Request::read(peer, 0).unwrap();
         handle_public(
             request,
             &registry.listing(),
@@ -679,6 +709,122 @@ mod tests {
             .status,
             403
         );
+    }
+
+    /// Host the production listeners on an isolated discovery port.
+    fn public_registry() -> SocketAddrV4 {
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            reservation.local_addr().unwrap().port(),
+        );
+        drop(reservation);
+        assert!(host(address).unwrap());
+        address
+    }
+
+    /// Unfinished bodies and oversized headers cannot block later listings.
+    #[test]
+    fn test_unfinished_browser_body_does_not_block_discovery() {
+        use std::io::{BufRead as _, BufReader};
+
+        // Keep rejected clients open, with more requests than the worker pool holds
+        let address = public_registry();
+        let mut stalled = Vec::new();
+        for (method, path, headers) in [
+            ("POST", "/forbidden", "Content-Length: 2048\r\n".to_owned()),
+            ("GET", "/v1/instances", "Content-Length: 1\r\n".to_owned()),
+            (
+                "GET",
+                "/v1/instances",
+                "Content-Length: 18446744073709551615\r\n".to_owned(),
+            ),
+            (
+                "POST",
+                "/v1/instances",
+                "Content-Length: 2048\r\nExpect: 100-continue\r\n".to_owned(),
+            ),
+            (
+                "OPTIONS",
+                "/v1/instances",
+                "Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n".to_owned(),
+            ),
+            (
+                "GET",
+                "/v1/instances",
+                format!("X-Large: {}\r\n", "x".repeat(8192)),
+            ),
+        ] {
+            let mut client = TcpStream::connect(address).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            write!(
+                client,
+                "{method} {path} HTTP/1.1\r\nHost: {address}\r\n{headers}\r\n"
+            )
+            .unwrap();
+            let mut client = BufReader::new(client);
+            let mut status = String::new();
+            client.read_line(&mut status).unwrap();
+            assert!(
+                status.starts_with("HTTP/1.1 413 "),
+                "{method} {path}: {status}"
+            );
+            stalled.push(client);
+        }
+
+        // A separate client must receive the listing while the others stay open
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        write!(
+            client,
+            "GET /v1/instances HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        let result = client.read_to_string(&mut response);
+        drop(stalled);
+        result.unwrap();
+        let reply = parse_reply(&response);
+        assert_eq!(reply.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply.body).unwrap(),
+            serde_json::json!({"version": 1, "instances": []})
+        );
+    }
+
+    /// A partial header has a deadline and leaves other discovery workers available.
+    #[test]
+    fn test_partial_browser_headers_do_not_block_discovery() {
+        // Occupy one worker with a request that has not finished its Host header
+        let address = public_registry();
+        let mut stalled = TcpStream::connect(address).unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stalled
+            .write_all(b"GET /v1/instances HTTP/1.1\r\nHost: ")
+            .unwrap();
+
+        // Another client can discover devices before the partial header times out
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        write!(
+            client,
+            "GET /v1/instances HTTP/1.1\r\nHost: {address}\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(parse_reply(&response).status, 200);
+
+        // The worker closes the unfinished request even while its client stays open
+        assert_eq!(stalled.read(&mut [0]).unwrap(), 0);
     }
 
     /// Builds a publication before the guest has reported its nameplate.

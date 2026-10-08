@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Bounded HTTP/1.1 exchanges over native IPC, leaving retries to each caller.
+//! Bounded HTTP/1.1 exchanges over local sockets, leaving retries to each caller.
 
 use std::io::{self, BufRead as _, BufReader, Read, Write};
 use std::time::Instant;
@@ -116,6 +116,7 @@ fn read_body(
 }
 
 /// Read one request, acknowledging 100-continue only after checking its limits.
+/// A zero body limit rejects transfer encoding before reading any chunk framing.
 pub(super) fn read_request(stream: &mut Stream, limit: usize) -> io::Result<Request<Vec<u8>>> {
     let mut reader = BufReader::new(stream);
     let head = read_head(&mut reader, MAX_HEADER)?;
@@ -138,6 +139,9 @@ pub(super) fn read_request(stream: &mut Stream, limit: usize) -> io::Result<Requ
             .and_then(|s| s.split(',').next()?.trim().parse::<u64>().ok())
             .is_some_and(|n| n > limit as u64)
     {
+        return Err(invalid(TooLarge));
+    }
+    if limit == 0 && request.headers().contains_key(header::TRANSFER_ENCODING) {
         return Err(invalid(TooLarge));
     }
     if request

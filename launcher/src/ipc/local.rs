@@ -4,11 +4,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Bounded HTTP exchanges over user-owned filesystem Unix-domain sockets.
+//! Bounded socket I/O and HTTP exchanges, with user-owned native listeners.
 //!
-//! Only native processes can reach these listeners. Their directories admit
-//! only the current user, through Unix permissions or Windows DACLs.
-//! Each connection carries one bounded HTTP request and one response.
+//! Native listeners use filesystem Unix-domain sockets. Their directories
+//! admit only the current user, through Unix permissions or Windows DACLs.
+//! Browser discovery uses the same bounded streams over loopback TCP, with its
+//! own route table. Each HTTP connection carries one request and one response.
 
 use std::cell::Cell;
 use std::fs::File;
@@ -24,6 +25,7 @@ use polling::{Event, Events, Poller};
 use sha2::{Digest as _, Sha256};
 use socket2::{Domain, SockAddr, Socket, Type};
 use tiny_http::{Header, Method, Response};
+use ureq_proto::http::Version;
 
 #[cfg(windows)]
 #[path = "local_windows.rs"]
@@ -236,7 +238,7 @@ impl Stream {
     }
 
     /// Wrap a connection with readiness waits and bounded I/O.
-    fn new(socket: Socket, timeout: Duration) -> io::Result<Self> {
+    pub(super) fn new(socket: Socket, timeout: Duration) -> io::Result<Self> {
         let io = ReadySocket::new(socket)?;
         let deadline = Instant::now() + timeout;
         Ok(Self {
@@ -421,7 +423,9 @@ impl Server {
 
     /// Bound the idle accept wait and the subsequent request read independently.
     pub(crate) fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<Request>> {
-        self.accept_timeout(timeout)?.map(Request::read).transpose()
+        self.accept_timeout(timeout)?
+            .map(|stream| Request::read(stream, MAX_REQUEST))
+            .transpose()
     }
 
     /// Accept a bounded native stream without imposing HTTP framing.
@@ -575,8 +579,10 @@ fn verify_directory(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-/// One bounded HTTP request whose reply closes the native connection.
+/// One bounded HTTP request whose reply closes its socket connection.
 pub(crate) struct Request {
+    /// HTTP version used for the reply's status line.
+    version: Version,
     /// Parsed HTTP method.
     method: Method,
     /// Exact request target, validated by the endpoint handler.
@@ -590,9 +596,9 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    /// Parse one HTTP request under size and time limits.
-    fn read(mut stream: Stream) -> io::Result<Self> {
-        let request = match super::http::read_request(&mut stream, MAX_REQUEST) {
+    /// Parse one HTTP request under the stream's deadline and a body size limit.
+    pub(super) fn read(mut stream: Stream, limit: usize) -> io::Result<Self> {
+        let request = match super::http::read_request(&mut stream, limit) {
             Ok(request) => request,
             Err(err) if err.kind() == io::ErrorKind::InvalidData => {
                 let status = if err
@@ -625,6 +631,7 @@ impl Request {
             );
         }
         Ok(Self {
+            version: request.version(),
             method,
             path,
             headers,
@@ -662,11 +669,12 @@ impl Request {
     pub(crate) fn body(&self) -> &[u8] {
         &self.body
     }
-    /// Send a response with its byte length and close the native connection.
+    /// Send a response with its byte length and close the socket connection.
     pub(crate) fn respond<R: Read>(mut self, response: Response<R>) -> io::Result<()> {
         let status = response.status_code();
         let mut raw = format!(
-            "HTTP/1.1 {} {}\r\nConnection: close\r\n",
+            "{:?} {} {}\r\nConnection: close\r\n",
+            self.version,
             status.0,
             status.default_reason_phrase()
         )
