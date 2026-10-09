@@ -134,6 +134,24 @@ cargo build --release -p launcher
 For everything the executable can do, run
 `./target/release/ark-emulator --help`.
 
+Linux amd64 packaging builds a reduced QEMU from the pinned submodule in an
+Ubuntu 22.04 container. Docker and Make are required in addition to Rust:
+
+```sh
+git submodule update --init --depth 1 third_party/qemu
+make qemu-linux
+make qemu-linux-check
+```
+
+The build stages QEMU in `launcher/binaries` and `launcher/qemu-libs` for
+Tauri packaging. Its runtime and corresponding-source archives are in
+`target/qemu-linux/artifacts`. The source archive includes the dependency
+sources and build recipes; GitHub's automatic repository archive omits
+submodule contents. Each Linux release publishes the source archive beside
+the installers. `QEMU_JOBS` controls compiler parallelism and `QEMU_OUTPUT`
+selects the build directory. The builder's module documentation describes
+the packaging and checks.
+
 ## Layout
 
 | path | role |
@@ -141,4 +159,6 @@ For everything the executable can do, run
 | `launcher/` | Rust runtime and optional Tauri window. Owns QEMU, the hardware connection and discovery, and carries the packaging config and macOS entitlements. |
 | `ui/` | Static HTML/CSS/JS. Renders device state from Rust and forwards user interactions through Tauri commands. |
 | `docs/` | Maintainer documentation. Currently the one-time Apple Developer setup the macOS signing in CI depends on. |
-| `.github/` | CI. Builds an installer per platform, then smoke tests each no-install artifact on a clean machine. The scripts under `scripts/` gather a relocatable QEMU and the pinned firmware for packaging; they are used by CI and runnable by hand. `packaging/` holds the Homebrew cask template a release publishes to the tap. |
+| `third_party/qemu/` | Upstream QEMU source pinned as a Git submodule. |
+| `tools/qemu-build/` | Linux QEMU builder, dependency and source packaging, and isolated runtime checks. |
+| `.github/` | CI and release support. `scripts/` gathers firmware and the macOS and Windows QEMU runtimes. `packaging/` holds the Linux QEMU configuration and the Homebrew cask template. |
