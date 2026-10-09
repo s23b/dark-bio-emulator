@@ -134,8 +134,10 @@ cargo build --release -p launcher
 For everything the executable can do, run
 `./target/release/ark-emulator --help`.
 
-Linux amd64 packaging builds a reduced QEMU from the pinned submodule in an
-Ubuntu 22.04 container. Docker and Make are required in addition to Rust:
+Packaging builds a reduced QEMU from the pinned submodule. Linux amd64 and
+Windows amd64 builds run on Linux with Docker. macOS builds run on the native
+architecture with Xcode, CMake, Ninja, pkg-config, Python 3 and xz. All builds
+require Rust, Git and Make:
 
 ```sh
 git submodule update --init --depth 1 third_party/qemu
@@ -143,14 +145,20 @@ make qemu-linux
 make qemu-linux-check
 ```
 
+Use `make qemu-windows` on Linux to cross-compile Windows QEMU, or
+`make qemu-macos` on either supported macOS architecture. Each target has a
+matching `-check` target. Windows execution checks run on Windows with the
+Visual Studio tools on `PATH`; the cross-build checks its DLL imports.
+
 The build stages QEMU in `launcher/binaries` and `launcher/qemu-libs` for
 Tauri packaging. Its runtime and corresponding-source archives are in
-`target/qemu-linux/artifacts`. The source archive includes the dependency
+`target/qemu-<platform>/artifacts`. The source archive includes the dependency
 sources and build recipes; GitHub's automatic repository archive omits
-submodule contents. Each Linux release publishes the source archive beside
-the installers. `QEMU_JOBS` controls compiler parallelism and `QEMU_OUTPUT`
-selects the build directory. The builder's module documentation describes
-the packaging and checks.
+submodule contents. Every platform publishes its source archive beside the
+installers. macOS and Windows link their third-party libraries statically
+and require only operating system libraries at runtime. `QEMU_JOBS` controls
+compiler parallelism, and `QEMU_OUTPUT` selects the build directory. The
+builder's module documentation describes the packaging and checks.
 
 ## Layout
 
@@ -160,5 +168,5 @@ the packaging and checks.
 | `ui/` | Static HTML/CSS/JS. Renders device state from Rust and forwards user interactions through Tauri commands. |
 | `docs/` | Maintainer documentation. Currently the one-time Apple Developer setup the macOS signing in CI depends on. |
 | `third_party/qemu/` | Upstream QEMU source pinned as a Git submodule. |
-| `tools/qemu-build/` | Linux QEMU builder, dependency and source packaging, and isolated runtime checks. |
-| `.github/` | CI and release support. `scripts/` gathers firmware and the macOS and Windows QEMU runtimes. `packaging/` holds the Linux QEMU configuration and the Homebrew cask template. |
+| `tools/qemu-build/` | QEMU builder, dependency and source packaging, and runtime checks for each platform. |
+| `.github/` | CI and release support. `scripts/` gathers firmware and tests packaged applications. `packaging/` holds QEMU configurations, installer support and the Homebrew cask template. |
